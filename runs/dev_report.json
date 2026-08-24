@@ -5,64 +5,66 @@
   "skipped_no_qrels": [],
   "aggregate_metrics": {
     "ndcg@10": 0.2913692766998683,
-    "map": 0.1725198412698413,
+    "map@10": 0.17251984126984124,
     "mrr": 0.2833333333333333,
     "p@10": 0.16666666666666666
   },
   "leaderboard": {
     "ndcg@10": 0.2913692766998683,
-    "map": 0.1725198412698413,
-    "provisional_score_90pct": 0.23846246194387605,
-    "note": "This is nDCG@10 and MAP combined at their 70%/20% weights (90% of the total). The remaining \u00b110% efficiency modifier is computed relative to the whole class's timings and is applied when course staff aggregate the real leaderboard.",
+    "map@10": 0.17251984126984124,
+    "provisional_score_80pct": 0.2212104778168919,
+    "note": "This is nDCG@10 and MAP@10 combined at their 70%/10% weights (80% of the total). The remaining \u00b110% efficiency modifier and 0-10% index-size score are both computed relative to the whole class and are applied when course staff aggregate the real leaderboard.",
     "baseline_ndcg@10": 0.862480709374298,
-    "baseline_map": 0.6836309523809524,
+    "baseline_map@10": 0.6836309523809524,
     "beats_baseline_ndcg@10": false,
-    "beats_baseline_map": false
+    "beats_baseline_map@10": false
   },
   "efficiency": {
-    "index_build_seconds": 6.779200000000402e-05,
-    "mean_query_latency_seconds": 3.090333333331576e-06,
-    "max_query_latency_seconds": 1.0166999999998427e-05
+    "index_build_seconds": 0.00020020900410600007,
+    "index_load_seconds": 3.4374999813735485e-05,
+    "index_size_bytes": 131,
+    "mean_query_latency_seconds": 1.0973320362002899e-06,
+    "max_query_latency_seconds": 2.291999408043921e-06
   },
   "per_query_metrics": {
     "q1": {
       "ndcg@10": 0.33841623911498764,
-      "map": 0.09166666666666667,
+      "map@10": 0.09166666666666667,
       "mrr": 0.16666666666666666,
       "p@10": 0.2,
       "num_ranked": 10
     },
     "q2": {
       "ndcg@10": 0.11238324925890603,
-      "map": 0.08333333333333333,
+      "map@10": 0.08333333333333333,
       "mrr": 0.3333333333333333,
       "p@10": 0.1,
       "num_ranked": 10
     },
     "q3": {
       "ndcg@10": 0.4359955936711009,
-      "map": 0.19583333333333333,
+      "map@10": 0.19583333333333333,
       "mrr": 0.2,
       "p@10": 0.3,
       "num_ranked": 10
     },
     "q4": {
       "ndcg@10": 0.0,
-      "map": 0.0,
+      "map@10": 0.0,
       "mrr": 0.0,
       "p@10": 0.0,
       "num_ranked": 10
     },
     "q5": {
       "ndcg@10": 0.8614205781542149,
-      "map": 0.6642857142857143,
+      "map@10": 0.6642857142857143,
       "mrr": 1.0,
       "p@10": 0.4,
       "num_ranked": 10
     },
     "q6": {
       "ndcg@10": 0.0,
-      "map": 0.0,
+      "map@10": 0.0,
       "mrr": 0.0,
       "p@10": 0.0,
       "num_ranked": 10

@@ -8,3 +8,5 @@ data/full/
 *.aux
 *.out
 *.log
+.venv
+
