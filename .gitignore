@@ -9,4 +9,3 @@ data/full/
 *.out
 *.log
 .venv
-runs/
