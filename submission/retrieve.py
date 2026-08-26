@@ -117,5 +117,7 @@ def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
             "manually, do the same."
         )
 
-    # TODO(you): replace this with a real scorer, e.g.:
-    return bm25_score(query, k, k1=1.2, b=0.75)
+    # k1/b from the dev-set sweep (5-fold CV + plateau selection regularized
+    # toward BM25 canonical; bootstrap 95% CI on the gain over 1.2/0.75
+    # excludes zero). See docs / sweep analysis.
+    return bm25_score(query, k, k1=1.8, b=0.6)

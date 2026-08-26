@@ -9,6 +9,9 @@ pytest>=7.0
 # Using pybind11 instead of Cython is also fine — add it here yourself.
 Cython>=3.0
 
+# Stemming (used by submission/indexer.py tokenizer)
+nltk>=3.8
+
 # Needed only for scripts/download_full_corpus.py (fetching the real
 # assignment corpus). Not required to run the toy set or the harness itself.
 ir_datasets>=0.5.5

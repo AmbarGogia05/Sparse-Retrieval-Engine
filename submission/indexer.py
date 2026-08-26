@@ -30,25 +30,68 @@ assignments — see the `save()` docstring for concrete starting points.
 import re
 from typing import Dict, List, Tuple
 import json
+from nltk.stem.snowball import SnowballStemmer
 
-"""
-v1 of the tokenizer, which is a simple regex-based tokenizer that lowercases,
-and for hyphenated words, keeps the hyphenated version as well as the 
-individual tokens. For example, "SARS-CoV-2" will be tokenized into 
-["sars-cov-2", "sars", "cov", "2"].
-"""
-
+_STEMMER = SnowballStemmer("english")
 _HYPHEN_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)+")
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+_HYPHEN_RE_CASE = re.compile(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)+")
+_TOKEN_RE_CASE = re.compile(r"[a-zA-Z0-9]+")
+_WORD_RE = re.compile(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)+|[a-zA-Z0-9]+")
 
 
-def tokenize(text: str) -> List[str]:
+def _has_internal_upper(s: str) -> bool:
+    return any(c.isupper() for c in s[1:])
+
+
+def tokenize_v0(text: str) -> List[str]:
     lower = text.lower()
     tokens = []
     for m in _HYPHEN_RE.finditer(lower):
-        tokens.append(m.group())  # "sars-cov-2"
-    tokens.extend(_TOKEN_RE.findall(lower))  # "sars", "cov", "2" (plus everything else)
+        tokens.append(_STEMMER.stem(m.group()))
+    for m in _TOKEN_RE.findall(lower):
+        tokens.append(_STEMMER.stem(m))
     return tokens
+
+
+_CASE_TERMS: set = None
+
+
+def _is_case_candidate(word: str) -> bool:
+    return len(word) >= 2 and _has_internal_upper(word)
+
+
+def tokenize_v1(text: str) -> Tuple[List[str], int]:
+    tokens = []
+    primary_count = 0
+    for m in _WORD_RE.finditer(text):
+        word = m.group()
+        is_hyphen = "-" in word
+        primary_count += 1
+        if is_hyphen:
+            concat = word.replace("-", "")
+            tokens.append(_STEMMER.stem(concat.lower()))
+            if _is_case_candidate(concat):
+                tokens.append(concat)
+            for part in word.split("-"):
+                tokens.append(_STEMMER.stem(part.lower()))
+        else:
+            tokens.append(_STEMMER.stem(word.lower()))
+            if _is_case_candidate(word):
+                tokens.append(word)
+    return tokens, primary_count
+
+
+def tokenize(text: str) -> List[str]:
+    tokens, _ = tokenize_v1(text)
+    if _CASE_TERMS is not None:
+        tokens = [t for t in tokens if t == t.lower() or t in _CASE_TERMS]
+    return tokens
+
+
+def set_case_terms(case_terms: set) -> None:
+    global _CASE_TERMS
+    _CASE_TERMS = case_terms
 
 
 class InvertedIndex:
@@ -73,8 +116,8 @@ class InvertedIndex:
         submission.corpus_utils.load_corpus().
         """
         for doc_id, text in corpus:
-            tokens = tokenize(text)
-            self.doc_len[doc_id] = len(tokens)
+            tokens, primary_count = tokenize_v1(text)
+            self.doc_len[doc_id] = primary_count
             self.doc_text[doc_id] = text
             for token in tokens:
                 if token not in self.postings:
@@ -110,11 +153,30 @@ class InvertedIndex:
             store gaps instead of absolute ids) and varint/byte-pack them,
             instead of a naive JSON list of integers.
         """
+        case_terms = set()
+        prune = []
+        df_ratio_threshold = 0.5
+        for term in self.postings:
+            if term != term.lower():
+                canonical = _STEMMER.stem(term.lower())
+                canon_df = self.document_frequency(canonical)
+                if canon_df == 0:
+                    case_terms.add(term)
+                    continue
+                ratio = self.document_frequency(term) / canon_df
+                if ratio <= df_ratio_threshold:
+                    case_terms.add(term)
+                else:
+                    prune.append(term)
+        for term in prune:
+            del self.postings[term]
+
         json_data = {
             "postings": self.postings,
             "doc_len": self.doc_len,
             "N": self.N,
             "avg_doc_len": self.avg_doc_len,
+            "case_terms": list(case_terms),
         }
         with open(f"{index_dir}/index.json", "w") as f:
             json.dump(json_data, f)
@@ -132,4 +194,6 @@ class InvertedIndex:
         index.doc_len = json_data["doc_len"]
         index.N = json_data["N"]
         index.avg_doc_len = json_data["avg_doc_len"]
+        case_terms = set(json_data.get("case_terms", []))
+        set_case_terms(case_terms)
         return index
