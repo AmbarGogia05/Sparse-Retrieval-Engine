@@ -48,8 +48,7 @@ from typing import List, Optional, Tuple
 
 from submission.corpus_utils import load_corpus
 from submission.indexer import InvertedIndex
-from submission.bm25 import score as bm25_score, build as bm25_build
-from submission.boolean_vsm import build as vsm_build
+from submission import custom_scorer
 
 # TODO(you): once implemented, import and use your real scorers, e.g.:
 # from submission import bm25, boolean_vsm, custom_scorer
@@ -102,8 +101,7 @@ def load_index(index_dir: str) -> None:
     #
     # and store it in a module-level variable so retrieve() can use it.
     _INDEX = InvertedIndex.load(index_dir)
-    bm25_build(_INDEX)
-    vsm_build(_INDEX)
+    custom_scorer.build(_INDEX)
 
 
 def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
@@ -117,7 +115,6 @@ def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
             "manually, do the same."
         )
 
-    # k1/b from the dev-set sweep (5-fold CV + plateau selection regularized
-    # toward BM25 canonical; bootstrap 95% CI on the gain over 1.2/0.75
-    # excludes zero). See docs / sweep analysis.
-    return bm25_score(query, k, k1=1.8, b=0.6)
+    # RRF fusion of BM25 (k1=1.8, b=0.6) and VSM. See custom_scorer.py and
+    # runs/fusion_results.json: dev nDCG@10 0.6405 vs BM25-alone 0.5900.
+    return custom_scorer.score(query, k)

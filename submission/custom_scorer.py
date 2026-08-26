@@ -15,18 +15,47 @@ final competition entry").
 from typing import List, Tuple
 
 from submission.indexer import InvertedIndex
+from submission import bm25
+from submission import boolean_vsm
+
+# Reciprocal Rank Fusion of BM25 and VSM. Chosen over a tuned linear
+# combination because it is scale-free (fuses ranks, not the mismatched
+# BM25 / cosine magnitudes) and parameter-free (k is a fixed convention),
+# so there is nothing fitted on the 50 dev queries to overfit. On the dev
+# set it scored nDCG@10 0.6405 vs BM25-alone 0.5900 (+0.0505). See
+# scripts/fuse_scores.py and runs/fusion_results.json.
+RRF_K = 60
+BM25_K1 = 1.8
+BM25_B = 0.6
+
+# Only the top of each ranking matters to RRF: with k=60, a doc at rank
+# 1000 contributes 1/1060 ~ 0.0009, far below anything that reaches the
+# top 10. So we fuse each retriever's top-CAND candidates instead of all
+# ~150K, cutting per-query latency with negligible effect on nDCG@10.
+_CAND = 1000
 
 
 def build(index: InvertedIndex) -> None:
-    """Called from retrieve.load_index(), not retrieve.build_index() — the
-    harness runs those two in separate processes. Anything this needs at
-    query time either comes from the loaded InvertedIndex or must have
-    been written to index_dir by InvertedIndex.save() (which then counts
-    toward your index-size score)."""
-    raise NotImplementedError
+    """Called from retrieve.load_index(). Just prepares the two underlying
+    scorers against the same loaded index; RRF needs no state of its own."""
+    bm25.build(index)
+    boolean_vsm.build(index)
+
+
+def _ranks(hits: List[Tuple[str, float]]) -> dict:
+    """doc_id -> 1-based rank from a (doc_id, score) list, best first."""
+    return {doc_id: i for i, (doc_id, _) in enumerate(hits, start=1)}
 
 
 def score(query: str, k: int) -> List[Tuple[str, float]]:
-    """Return up to k (doc_id, score) pairs for `query`, ranked by your
-    own combined/custom scoring function, highest score first."""
-    raise NotImplementedError
+    """Return up to k (doc_id, rrf_score) pairs for `query`, best first."""
+    bm_ranks = _ranks(bm25.score(query, _CAND, k1=BM25_K1, b=BM25_B))
+    vs_ranks = _ranks(boolean_vsm.vsm_score(query, _CAND))
+
+    fused = {}
+    for doc_id, r in bm_ranks.items():
+        fused[doc_id] = fused.get(doc_id, 0.0) + 1.0 / (RRF_K + r)
+    for doc_id, r in vs_ranks.items():
+        fused[doc_id] = fused.get(doc_id, 0.0) + 1.0 / (RRF_K + r)
+
+    return sorted(fused.items(), key=lambda x: x[1], reverse=True)[:k]
