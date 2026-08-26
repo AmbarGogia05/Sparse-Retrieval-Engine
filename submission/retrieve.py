@@ -41,11 +41,15 @@ correctly, so it exercises the full build -> disk -> fresh process -> load
 close to zero; replace the logic, but keep the same
 persist-in-build / reconstruct-in-load shape.
 """
+
 import json
 import os
 from typing import List, Optional, Tuple
 
 from submission.corpus_utils import load_corpus
+from submission.indexer import InvertedIndex
+from submission.bm25 import score as bm25_score, build as bm25_build
+from submission.boolean_vsm import build as vsm_build
 
 # TODO(you): once implemented, import and use your real scorers, e.g.:
 # from submission import bm25, boolean_vsm, custom_scorer
@@ -58,9 +62,7 @@ from submission.corpus_utils import load_corpus
 # must be written to index_dir in build_index() and read back in
 # load_index().
 # ---------------------------------------------------------------------------
-_DOC_ORDER: Optional[List[str]] = None  # [doc_id, ...] in the order build_index() saw them
-
-_DOC_ORDER_FILENAME = "doc_order.json"  # TODO(you): replace with your real index files
+_INDEX = None
 
 
 def build_index(corpus_path: str, index_dir: str) -> None:
@@ -79,16 +81,9 @@ def build_index(corpus_path: str, index_dir: str) -> None:
     # TODO(you): build your real inverted index / term statistics here, e.g.:
     #
     #   from submission.indexer import InvertedIndex
-    #   index = InvertedIndex()
-    #   index.build(corpus)
-    #   index.save(index_dir)          # <- persist it (see indexer.py)
-    #
-    # The trivial baseline below only persists doc_id order, which is all
-    # `_baseline_retrieve` needs.
-    os.makedirs(index_dir, exist_ok=True)
-    doc_order = [doc_id for doc_id, _text in corpus]
-    with open(os.path.join(index_dir, _DOC_ORDER_FILENAME), "w", encoding="utf-8") as f:
-        json.dump(doc_order, f)
+    index = InvertedIndex()
+    index.build(corpus)
+    index.save(index_dir)  # <- persist it (see indexer.py)
 
 
 def load_index(index_dir: str) -> None:
@@ -96,7 +91,7 @@ def load_index(index_dir: str) -> None:
     `index_dir`. Runs once, in a fresh process, before any retrieve()
     calls — there is no leftover state from build_index() to rely on.
     """
-    global _DOC_ORDER
+    global _INDEX
 
     # TODO(you): load your real index here, e.g.:
     #
@@ -106,14 +101,14 @@ def load_index(index_dir: str) -> None:
     #   boolean_vsm.build(index)
     #
     # and store it in a module-level variable so retrieve() can use it.
-    path = os.path.join(index_dir, _DOC_ORDER_FILENAME)
-    with open(path, encoding="utf-8") as f:
-        _DOC_ORDER = json.load(f)
+    _INDEX = InvertedIndex.load(index_dir)
+    bm25_build(_INDEX)
+    vsm_build(_INDEX)
 
 
 def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
     """Return up to k (doc_id, score) pairs for `query`, best first."""
-    if _DOC_ORDER is None:
+    if _INDEX is None:
         raise RuntimeError(
             "retrieve() called before load_index(); the harness always "
             "calls build_index(corpus_path, index_dir) and then "
@@ -123,18 +118,4 @@ def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
         )
 
     # TODO(you): replace this with a real scorer, e.g.:
-    #   return bm25.score(query, k, k1=1.2, b=0.75)
-    return _baseline_retrieve(query, k)
-
-
-# ---------------------------------------------------------------------------
-# Trivial reference baseline — DO NOT submit this as your final entry.
-# Ignores the query and returns the first k documents in the order
-# build_index() persisted them, with a dummy descending score. Enough to
-# exercise the full harness, including real disk persistence across a
-# fresh process; metrics against it will legitimately be close to zero.
-# ---------------------------------------------------------------------------
-def _baseline_retrieve(query: str, k: int) -> List[Tuple[str, float]]:
-    assert _DOC_ORDER is not None
-    top = _DOC_ORDER[:k]
-    return [(doc_id, float(len(top) - i)) for i, doc_id in enumerate(top)]
+    return bm25_score(query, k, k1=1.2, b=0.75)
