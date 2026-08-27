@@ -22,6 +22,7 @@ from setuptools import setup
 ext_modules = [
     Pybind11Extension("_vbyte_cpp", ["_vbyte_cpp.cpp"], cxx_std=17),
     Pybind11Extension("_index_cpp", ["_index_cpp.cpp"], cxx_std=17),
+    Pybind11Extension("_spimi_cpp", ["_spimi_cpp.cpp"], cxx_std=17),
 ]
 
 setup(

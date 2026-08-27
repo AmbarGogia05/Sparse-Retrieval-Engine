@@ -33,6 +33,22 @@ import json
 from nltk.stem.snowball import SnowballStemmer
 
 _STEMMER = SnowballStemmer("english")
+
+# Snowball stemming dominates build time (~95%), and the tokenizer re-stems
+# every token occurrence — so common words like "the"/"covid" get stemmed
+# millions of times. Memoise on the raw word: identical output, ~5x faster
+# build. The cache is per-process and unbounded (vocab is finite, ~10^5).
+_STEM_CACHE = {}
+
+
+def _stem(word: str) -> str:
+    s = _STEM_CACHE.get(word)
+    if s is None:
+        s = _STEMMER.stem(word)
+        _STEM_CACHE[word] = s
+    return s
+
+
 _HYPHEN_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)+")
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _HYPHEN_RE_CASE = re.compile(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)+")
@@ -70,13 +86,13 @@ def tokenize_v1(text: str) -> Tuple[List[str], int]:
         primary_count += 1
         if is_hyphen:
             concat = word.replace("-", "")
-            tokens.append(_STEMMER.stem(concat.lower()))
+            tokens.append(_stem(concat.lower()))
             if _is_case_candidate(concat):
                 tokens.append(concat)
             for part in word.split("-"):
-                tokens.append(_STEMMER.stem(part.lower()))
+                tokens.append(_stem(part.lower()))
         else:
-            tokens.append(_STEMMER.stem(word.lower()))
+            tokens.append(_stem(word.lower()))
             if _is_case_candidate(word):
                 tokens.append(word)
     return tokens, primary_count

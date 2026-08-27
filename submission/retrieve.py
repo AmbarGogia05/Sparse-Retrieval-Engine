@@ -63,6 +63,15 @@ from submission import custom_scorer
 # ---------------------------------------------------------------------------
 _INDEX = None
 
+# SPIMI: flush the in-memory postings block once it holds this many postings.
+# ~40M postings ≈ 1.5 GB accumulator — well within an 8 GB budget alongside
+# the corpus text and interpreter, with headroom for the merge phase. Small
+# corpora (e.g. 171K docs ≈ 17M postings) stay a single in-memory block.
+_SPIMI_FLUSH_POSTINGS = 40_000_000
+
+# Truecase gate threshold; must match InvertedIndex.save_v2's 0.5.
+_CASE_DF_RATIO = 0.5
+
 
 def build_index(corpus_path: str, index_dir: str) -> None:
     """Load the corpus, build whatever index structures you need, and
@@ -77,14 +86,25 @@ def build_index(corpus_path: str, index_dir: str) -> None:
     """
     corpus = load_corpus(corpus_path)
 
-    # TODO(you): build your real inverted index / term statistics here, e.g.:
-    #
-    #   from submission.indexer import InvertedIndex
-    index = InvertedIndex()
-    index.build(corpus)
-    # Compressed persistence (int doc-ids + gap + VByte). The JSON baseline
-    # index.save(index_dir) is kept in indexer.py for reference/testing.
-    index.save_v2(index_dir)
+    # Prefer the C++ SPIMI builder: it accumulates postings in C++ and flushes
+    # sorted blocks to disk past a threshold, then merges them into the
+    # compressed on-disk format (same files as InvertedIndex.save_v2), so peak
+    # memory stays bounded on large corpora. Tokenisation stays in Python
+    # (memoised nltk). Falls back to the pure-Python build + save_v2.
+    try:
+        from submission._spimi_cpp import SpimiBuilder
+        from submission.indexer import tokenize_v1, _stem
+
+        builder = SpimiBuilder(index_dir, _SPIMI_FLUSH_POSTINGS)
+        for doc_id, text in corpus:
+            tokens, doc_len = tokenize_v1(text)
+            builder.add_document(doc_id, tokens, doc_len)
+        canonical = {t: _stem(t.lower()) for t in builder.case_terms()}
+        builder.finalize(canonical, _CASE_DF_RATIO)
+    except ImportError:
+        index = InvertedIndex()
+        index.build(corpus)
+        index.save_v2(index_dir)  # JSON save() kept in indexer.py for reference
 
 
 def load_index(index_dir: str) -> None:
