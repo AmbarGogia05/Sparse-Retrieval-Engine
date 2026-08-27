@@ -93,11 +93,11 @@ def build_index(corpus_path: str, index_dir: str) -> None:
     # (memoised nltk). Falls back to the pure-Python build + save_v2.
     try:
         from submission._spimi_cpp import SpimiBuilder
-        from submission.indexer import tokenize_v1, _stem
+        from submission.indexer import tokenize_doc, _stem
 
         builder = SpimiBuilder(index_dir, _SPIMI_FLUSH_POSTINGS)
         for doc_id, text in corpus:
-            tokens, doc_len = tokenize_v1(text)
+            tokens, doc_len = tokenize_doc(text)
             builder.add_document(doc_id, tokens, doc_len)
         canonical = {t: _stem(t.lower()) for t in builder.case_terms()}
         builder.finalize(canonical, _CASE_DF_RATIO)

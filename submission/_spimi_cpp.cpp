@@ -23,6 +23,7 @@
 #include <map>
 #include <algorithm>
 #include <fstream>
+#include <iterator>
 #include <cstdint>
 #include <cmath>
 #include <iomanip>
@@ -41,6 +42,19 @@ static void put_vbyte(std::string &out, long n) {
             break;
         }
     }
+}
+
+// Read one VByte from a byte buffer, advancing pos (mirror of put_vbyte).
+static long get_vbyte(const unsigned char *p, size_t &pos) {
+    long n = 0;
+    int s = 0;
+    unsigned char b;
+    do {
+        b = p[pos++];
+        n |= static_cast<long>(b & 0x7F) << s;
+        s += 7;
+    } while (!(b & 0x80));
+    return n;
 }
 
 template <typename T>
@@ -83,8 +97,27 @@ struct SpimiBuilder {
     std::ofstream docs_out;
     std::unordered_set<std::string> case_terms_seen;
 
+    // Forward index (doc -> its terms+tfs), needed to build RM3 relevance
+    // models at query time. Term ordinals aren't known until the final merge
+    // fixes the vocabulary order, so during streaming we write each doc's
+    // vector keyed by a stable *local* id, then remap local -> final ord in a
+    // single pass in finalize(). `vocab` (string -> local id) is bounded by
+    // vocabulary size (~10^5), not by the postings, so it doesn't threaten the
+    // OOM-safety the block flushing provides.
+    std::unordered_map<std::string, uint32_t> vocab;
+    std::ofstream fwd_tmp;
+
     SpimiBuilder(const std::string &d, size_t threshold)
-        : dir(d), flush_threshold(threshold), docs_out(d + "/docs.txt") {}
+        : dir(d), flush_threshold(threshold), docs_out(d + "/docs.txt"),
+          fwd_tmp(d + "/forward.tmp", std::ios::binary) {}
+
+    uint32_t local_id(const std::string &t) {
+        auto it = vocab.find(t);
+        if (it != vocab.end()) return it->second;
+        uint32_t id = static_cast<uint32_t>(vocab.size());
+        vocab.emplace(t, id);
+        return id;
+    }
 
     static bool has_upper(const std::string &s) {
         for (char c : s)
@@ -102,11 +135,26 @@ struct SpimiBuilder {
             tf[t]++;
             if (has_upper(t)) case_terms_seen.insert(t);
         }
+        std::vector<std::pair<uint32_t, uint32_t>> fwd;  // (local id, tf)
+        fwd.reserve(tf.size());
         for (auto &kv : tf) {
             auto &vec = block[kv.first];
             vec.push_back({ord, kv.second});
             cur_postings++;
+            fwd.push_back({local_id(kv.first), kv.second});
         }
+        // Append this doc's forward vector (local-id gaps + tfs) to forward.tmp.
+        std::sort(fwd.begin(), fwd.end());
+        std::string rec;
+        put_vbyte(rec, static_cast<long>(fwd.size()));
+        uint32_t prev = 0;
+        for (size_t i = 0; i < fwd.size(); i++) {
+            put_vbyte(rec, i == 0 ? fwd[i].first : fwd[i].first - prev);
+            prev = fwd[i].first;
+        }
+        for (auto &p : fwd) put_vbyte(rec, p.second);
+        fwd_tmp.write(rec.data(), rec.size());
+
         if (cur_postings >= flush_threshold) flush_block();
     }
 
@@ -138,9 +186,52 @@ struct SpimiBuilder {
         return std::vector<std::string>(case_terms_seen.begin(), case_terms_seen.end());
     }
 
+    // Second pass over forward.tmp: remap local ids -> final term ordinals,
+    // drop pruned terms, re-sort each doc's terms by final ordinal, and write
+    // the compressed forward.bin (per doc: VByte count, then final-ordinal
+    // gaps, then tfs). Doc order matches docs.txt (streamed in add order).
+    void write_forward(const std::vector<int> &local_to_final) {
+        std::ifstream f(dir + "/forward.tmp", std::ios::binary);
+        std::string buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        f.close();
+        const unsigned char *p = reinterpret_cast<const unsigned char *>(buf.data());
+        size_t pos = 0;
+        std::string out;
+        for (uint32_t d = 0; d < n_docs; d++) {
+            long n = get_vbyte(p, pos);
+            std::vector<uint32_t> locs(n);
+            std::vector<uint32_t> tfs(n);
+            long prev = 0;
+            for (long i = 0; i < n; i++) {
+                long g = get_vbyte(p, pos);
+                prev = (i == 0) ? g : prev + g;
+                locs[i] = static_cast<uint32_t>(prev);
+            }
+            for (long i = 0; i < n; i++) tfs[i] = static_cast<uint32_t>(get_vbyte(p, pos));
+
+            std::vector<std::pair<int, uint32_t>> keep;  // (final ord, tf)
+            keep.reserve(n);
+            for (long i = 0; i < n; i++) {
+                int fo = local_to_final[locs[i]];
+                if (fo >= 0) keep.push_back({fo, tfs[i]});
+            }
+            std::sort(keep.begin(), keep.end());
+
+            put_vbyte(out, static_cast<long>(keep.size()));
+            int pf = 0;
+            for (size_t i = 0; i < keep.size(); i++) {
+                put_vbyte(out, i == 0 ? keep[i].first : keep[i].first - pf);
+                pf = keep[i].first;
+            }
+            for (auto &kv : keep) put_vbyte(out, kv.second);
+        }
+        std::ofstream(dir + "/forward.bin", std::ios::binary).write(out.data(), out.size());
+    }
+
     void finalize(const std::unordered_map<std::string, std::string> &canonical, double df_ratio) {
         flush_block();
         docs_out.close();
+        fwd_tmp.close();
 
         // Pass 1: global df per term (header scan, skipping postings bytes).
         std::unordered_map<std::string, uint32_t> df_all;
@@ -181,6 +272,13 @@ struct SpimiBuilder {
         std::string postings;  // buffered, written once
         bool first_term = true;
 
+        // Map each surviving term's local id -> its final ordinal (position in
+        // terms.txt). Pruned / never-emitted terms keep -1 so the forward-index
+        // remap drops them. NativeIndex assigns term ids in terms.txt order, so
+        // "final ordinal" == the id RM3 will look terms up by.
+        std::vector<int> local_to_final(vocab.size(), -1);
+        int final_ord = 0;
+
         while (true) {
             // smallest current term across readers
             std::string mterm;
@@ -200,6 +298,8 @@ struct SpimiBuilder {
             }
             if (prune.count(mterm)) continue;
 
+            local_to_final[vocab[mterm]] = final_ord++;
+
             if (!first_term) terms_out << '\n';
             first_term = false;
             terms_out << mterm << '\t' << ords.size();
@@ -214,6 +314,8 @@ struct SpimiBuilder {
 
         for (auto *r : readers) delete r;
         std::ofstream(dir + "/postings.bin", std::ios::binary).write(postings.data(), postings.size());
+
+        write_forward(local_to_final);
 
         // meta.json (N, avg_doc_len, case_terms) — hand-written, no JSON dep.
         double avg = n_docs ? static_cast<double>(total_len) / n_docs : 0.0;
@@ -230,6 +332,7 @@ struct SpimiBuilder {
         meta.close();
 
         for (auto &path : block_files) std::remove(path.c_str());
+        std::remove((dir + "/forward.tmp").c_str());
     }
 };
 

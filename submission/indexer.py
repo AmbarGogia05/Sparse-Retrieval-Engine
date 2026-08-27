@@ -27,6 +27,7 @@ compact postings encoding is worth more here than in most course
 assignments — see the `save()` docstring for concrete starting points.
 """
 
+import os
 import re
 from typing import Dict, List, Tuple
 import json
@@ -98,8 +99,83 @@ def tokenize_v1(text: str) -> Tuple[List[str], int]:
     return tokens, primary_count
 
 
+# ---------------------------------------------------------------------------
+# Optional experiment toggles (env-driven so the harness's separate build and
+# query subprocesses both see them). Defaults reproduce the shipped regex
+# tokenizer with NO stopword removal, byte-for-byte (tokenize_v1). NLTK
+# stopwords/word_tokenize are both permitted by the assignment.
+#   SRE_STOPWORDS=1  -> drop NLTK English stopwords (matched on the stemmed form)
+#   SRE_NLTK_TOK=1   -> segment with nltk.word_tokenize instead of the regex
+# ---------------------------------------------------------------------------
+_USE_STOPWORDS = os.environ.get("SRE_STOPWORDS") == "1"
+_USE_NLTK_TOK = os.environ.get("SRE_NLTK_TOK") == "1"
+
+_STEMMED_STOPWORDS: frozenset = frozenset()
+if _USE_STOPWORDS:
+    from nltk.corpus import stopwords as _nltk_stopwords
+    _STEMMED_STOPWORDS = frozenset(_stem(w) for w in _nltk_stopwords.words("english"))
+
+_nltk_word_tokenize = None
+if _USE_NLTK_TOK:
+    from nltk.tokenize import word_tokenize as _nltk_word_tokenize
+
+
+def _iter_words(text: str):
+    """Yield raw word strings from `text` (nltk word tokens when enabled, else
+    the regex matches). nltk tokens with no alphanumeric char are dropped."""
+    if _nltk_word_tokenize is not None:
+        for tok in _nltk_word_tokenize(text):
+            if any(c.isalnum() for c in tok):
+                yield tok
+    else:
+        for m in _WORD_RE.finditer(text):
+            yield m.group()
+
+
+def _emit_word(word: str, tokens: List[str]) -> int:
+    """Apply the v1 emission rules to one word, honoring stopword removal.
+    Returns the number of primary tokens emitted (0 if the word is a stopword)."""
+    if "-" in word:
+        concat = word.replace("-", "")
+        stem = _stem(concat.lower())
+        if _USE_STOPWORDS and stem in _STEMMED_STOPWORDS:
+            return 0
+        tokens.append(stem)
+        if _is_case_candidate(concat):
+            tokens.append(concat)
+        for part in word.split("-"):
+            tokens.append(_stem(part.lower()))
+        return 1
+    stem = _stem(word.lower())
+    if _USE_STOPWORDS and stem in _STEMMED_STOPWORDS:
+        return 0
+    tokens.append(stem)
+    if _is_case_candidate(word):
+        tokens.append(word)
+    return 1
+
+
+def tokenize_v2(text: str) -> Tuple[List[str], int]:
+    """Like tokenize_v1 but routed through _iter_words/_emit_word so the NLTK
+    tokenizer and stopword-removal toggles apply. With both toggles off it
+    yields the same tokens as tokenize_v1."""
+    tokens: List[str] = []
+    primary = 0
+    for word in _iter_words(text):
+        primary += _emit_word(word, tokens)
+    return tokens, primary
+
+
+def tokenize_doc(text: str) -> Tuple[List[str], int]:
+    """Tokeniser used by the index builder AND query path. Picks v2 when any
+    toggle is active, else the untouched v1."""
+    if _USE_STOPWORDS or _USE_NLTK_TOK:
+        return tokenize_v2(text)
+    return tokenize_v1(text)
+
+
 def tokenize(text: str) -> List[str]:
-    tokens, _ = tokenize_v1(text)
+    tokens, _ = tokenize_doc(text)
     if _CASE_TERMS is not None:
         tokens = [t for t in tokens if t == t.lower() or t in _CASE_TERMS]
     return tokens
@@ -196,7 +272,7 @@ class InvertedIndex:
         submission.corpus_utils.load_corpus().
         """
         for doc_id, text in corpus:
-            tokens, primary_count = tokenize_v1(text)
+            tokens, primary_count = tokenize_doc(text)
             self.doc_len[doc_id] = primary_count
             self.doc_text[doc_id] = text
             for token in tokens:
@@ -329,6 +405,28 @@ class InvertedIndex:
             f.write("\n".join(term_lines))
         with open(f"{index_dir}/postings.bin", "wb") as f:
             f.write(bytes(blob))
+
+        # Forward index (doc -> [(term_ord, tf)]) for RM3 relevance models.
+        # term_ord is the term's position in the self.postings iteration order,
+        # which is exactly terms.txt order == the ids NativeIndex assigns. Same
+        # per-doc format as _spimi_cpp.write_forward: VByte(count) then gap-coded
+        # term-ordinal gaps then tfs, one record per doc in docs.txt order.
+        forward = {d: [] for d in self.doc_len}
+        for term_ord, (_term, plist) in enumerate(self.postings.items()):
+            for d, tf in plist.items():
+                forward[d].append((term_ord, tf))
+        fblob = bytearray()
+        for doc_id in self.doc_len:  # docs.txt order
+            items = sorted(forward[doc_id])  # ascending term_ord
+            ords = [o for o, _ in items]
+            tfs = [t for _, t in items]
+            gaps = [ords[0]] + [ords[i] - ords[i - 1] for i in range(1, len(ords))] if ords else []
+            fblob += _vbyte_encode([len(ords)])
+            fblob += _vbyte_encode(gaps)
+            fblob += _vbyte_encode(tfs)
+        with open(f"{index_dir}/forward.bin", "wb") as f:
+            f.write(bytes(fblob))
+
         with open(f"{index_dir}/meta.json", "w") as f:
             json.dump(
                 {"N": self.N, "avg_doc_len": self.avg_doc_len, "case_terms": list(case_terms)},
