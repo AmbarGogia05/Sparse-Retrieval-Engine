@@ -9,6 +9,12 @@ pytest>=7.0
 # Using pybind11 instead of Cython is also fine — add it here yourself.
 Cython>=3.0
 
+# We compile submission/_vbyte_cpp.cpp (postings decoder) via pybind11;
+# built with `python setup.py build_ext --inplace`. Optional at runtime —
+# indexer.py falls back to pure Python if the extension isn't built.
+pybind11>=2.11
+setuptools>=68  # provides distutils shim on Python 3.12+ for the build
+
 # Stemming (used by submission/indexer.py tokenizer)
 nltk>=3.8
 

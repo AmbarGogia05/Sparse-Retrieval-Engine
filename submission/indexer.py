@@ -94,6 +94,70 @@ def set_case_terms(case_terms: set) -> None:
     _CASE_TERMS = case_terms
 
 
+# ---------------------------------------------------------------------------
+# VByte (variable-byte) codec for the compressed index (save_v2/load_v2).
+# Non-negative ints, 7 bits per byte, high bit set on the final byte.
+# ---------------------------------------------------------------------------
+def _vbyte_encode(nums: List[int]) -> bytes:
+    out = bytearray()
+    for n in nums:
+        while True:
+            b = n & 0x7F
+            n >>= 7
+            if n:
+                out.append(b)
+            else:
+                out.append(b | 0x80)
+                break
+    return bytes(out)
+
+
+def _vbyte_decode_n(data: bytes, pos: int, count: int) -> Tuple[List[int], int]:
+    """Decode `count` VByte numbers from `data` starting at `pos`.
+    Returns (numbers, new_pos)."""
+    nums = []
+    for _ in range(count):
+        n = 0
+        shift = 0
+        while True:
+            b = data[pos]
+            pos += 1
+            n |= (b & 0x7F) << shift
+            if b & 0x80:
+                break
+            shift += 7
+        nums.append(n)
+    return nums, pos
+
+
+# Optional compiled accelerator for the postings decode (see
+# submission/_vbyte_cpp.cpp + setup.py). If it isn't built, we fall back to
+# pure Python — the submission runs either way.
+try:
+    from submission._vbyte_cpp import decode_all as _cpp_decode_all
+except ImportError:
+    _cpp_decode_all = None
+
+
+def _decode_all(blob: bytes, dfs: List[int]):
+    """For each term (given its df, in blob order) return (absolute sorted
+    doc ordinals, term frequencies). Uses the compiled decoder when present."""
+    if _cpp_decode_all is not None:
+        return _cpp_decode_all(bytes(blob), dfs)
+    out = []
+    pos = 0
+    for df in dfs:
+        gaps, pos = _vbyte_decode_n(blob, pos, df)
+        tfs, pos = _vbyte_decode_n(blob, pos, df)
+        ords = []
+        cur = 0
+        for i, g in enumerate(gaps):
+            cur = g if i == 0 else cur + g
+            ords.append(cur)
+        out.append((ords, tfs))
+    return out
+
+
 class InvertedIndex:
     """A minimal inverted index skeleton. Extend the data structures here
     however your design needs (e.g. term positions for phrase/proximity
@@ -196,4 +260,95 @@ class InvertedIndex:
         index.avg_doc_len = json_data["avg_doc_len"]
         case_terms = set(json_data.get("case_terms", []))
         set_case_terms(case_terms)
+        return index
+
+    # -----------------------------------------------------------------------
+    # Compressed persistence (v2): int doc-id mapping + gap encoding + VByte.
+    # Same on-disk information as save()/load() above, but a fraction of the
+    # bytes. Decompresses to the identical in-memory structure, so BM25/VSM
+    # and retrieve() are unchanged. save()/load() (JSON) are kept intact as
+    # the readable v0 baseline.
+    #
+    # Files written to index_dir:
+    #   meta.json    - N, avg_doc_len, case_terms
+    #   docs.txt     - N lines "doc_id<TAB>doc_len"; line number = ordinal
+    #   terms.txt    - vocab lines "term<TAB>df", in postings.bin block order
+    #   postings.bin - per term: VByte(gaps of sorted doc ordinals) then
+    #                  VByte(term frequencies), blocks concatenated in the
+    #                  same order as terms.txt
+    # -----------------------------------------------------------------------
+    def save_v2(self, index_dir: str) -> None:
+        # Same truecase df-ratio gate as save() (kept in sync deliberately).
+        case_terms = set()
+        prune = []
+        for term in self.postings:
+            if term != term.lower():
+                canon_df = self.document_frequency(_STEMMER.stem(term.lower()))
+                if canon_df == 0 or self.document_frequency(term) / canon_df <= 0.5:
+                    case_terms.add(term)
+                else:
+                    prune.append(term)
+        for term in prune:
+            del self.postings[term]
+
+        # Assign an integer ordinal to every doc (build order).
+        docid_to_ord = {}
+        with open(f"{index_dir}/docs.txt", "w") as f:
+            for doc_id, dl in self.doc_len.items():
+                docid_to_ord[doc_id] = len(docid_to_ord)
+                f.write(f"{doc_id}\t{dl}\n")
+
+        term_lines = []
+        blob = bytearray()
+        for term, plist in self.postings.items():
+            items = sorted((docid_to_ord[d], tf) for d, tf in plist.items())
+            ords = [o for o, _ in items]
+            tfs = [tf for _, tf in items]
+            gaps = [ords[0]] + [ords[i] - ords[i - 1] for i in range(1, len(ords))]
+            blob += _vbyte_encode(gaps)
+            blob += _vbyte_encode(tfs)
+            term_lines.append(f"{term}\t{len(ords)}")
+
+        with open(f"{index_dir}/terms.txt", "w") as f:
+            f.write("\n".join(term_lines))
+        with open(f"{index_dir}/postings.bin", "wb") as f:
+            f.write(bytes(blob))
+        with open(f"{index_dir}/meta.json", "w") as f:
+            json.dump(
+                {"N": self.N, "avg_doc_len": self.avg_doc_len, "case_terms": list(case_terms)},
+                f,
+            )
+
+    @classmethod
+    def load_v2(cls, index_dir: str) -> "InvertedIndex":
+        index = cls()
+        with open(f"{index_dir}/meta.json") as f:
+            meta = json.load(f)
+        index.N = meta["N"]
+        index.avg_doc_len = meta["avg_doc_len"]
+        set_case_terms(set(meta.get("case_terms", [])))
+
+        ord_to_docid = []
+        with open(f"{index_dir}/docs.txt") as f:
+            for line in f:
+                doc_id, dl = line.rstrip("\n").split("\t")
+                ord_to_docid.append(doc_id)
+                index.doc_len[doc_id] = int(dl)
+
+        with open(f"{index_dir}/postings.bin", "rb") as f:
+            blob = f.read()
+        with open(f"{index_dir}/terms.txt") as f:
+            terms_txt = f.read()
+
+        terms = []
+        dfs = []
+        for line in terms_txt.split("\n") if terms_txt else []:
+            term, df_s = line.split("\t")
+            terms.append(term)
+            dfs.append(int(df_s))
+
+        for term, (ords, tfs) in zip(terms, _decode_all(blob, dfs)):
+            index.postings[term] = {
+                ord_to_docid[o]: tf for o, tf in zip(ords, tfs)
+            }
         return index

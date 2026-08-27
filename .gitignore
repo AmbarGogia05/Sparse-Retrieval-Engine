@@ -9,3 +9,8 @@ data/full/
 *.out
 *.log
 .venv
+
+# Compiled pybind11 extension: platform-specific, built on the target from
+# submission/_vbyte_cpp.cpp via setup.py. Ship the source, not the binary.
+*.so
+build/

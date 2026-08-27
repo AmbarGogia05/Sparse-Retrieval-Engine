@@ -82,7 +82,9 @@ def build_index(corpus_path: str, index_dir: str) -> None:
     #   from submission.indexer import InvertedIndex
     index = InvertedIndex()
     index.build(corpus)
-    index.save(index_dir)  # <- persist it (see indexer.py)
+    # Compressed persistence (int doc-ids + gap + VByte). The JSON baseline
+    # index.save(index_dir) is kept in indexer.py for reference/testing.
+    index.save_v2(index_dir)
 
 
 def load_index(index_dir: str) -> None:
@@ -100,8 +102,22 @@ def load_index(index_dir: str) -> None:
     #   boolean_vsm.build(index)
     #
     # and store it in a module-level variable so retrieve() can use it.
-    _INDEX = InvertedIndex.load(index_dir)
-    custom_scorer.build(_INDEX)
+    # Prefer the native (C++) index: it decodes the postings and does BM25/VSM
+    # scoring in C++, avoiding both the Python dict reconstruction at load and
+    # the Python scoring loops per query. Falls back to the pure-Python
+    # InvertedIndex + bm25/boolean_vsm path if the extension isn't built.
+    try:
+        import submission._index_cpp  # noqa: F401  (presence check)
+        import json
+        from submission.indexer import set_case_terms
+
+        with open(f"{index_dir}/meta.json") as f:
+            set_case_terms(set(json.load(f).get("case_terms", [])))
+        custom_scorer.build_native(index_dir)
+        _INDEX = "native"  # non-None sentinel; scoring lives in custom_scorer
+    except ImportError:
+        _INDEX = InvertedIndex.load_v2(index_dir)
+        custom_scorer.build(_INDEX)
 
 
 def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:

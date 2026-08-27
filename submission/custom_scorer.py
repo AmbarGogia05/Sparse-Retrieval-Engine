@@ -14,7 +14,7 @@ final competition entry").
 """
 from typing import List, Tuple
 
-from submission.indexer import InvertedIndex
+from submission.indexer import InvertedIndex, tokenize
 from submission import bm25
 from submission import boolean_vsm
 
@@ -36,11 +36,28 @@ BM25_B = 0.6
 _CAND = 1000
 
 
+# When a native (C++) index is loaded, scoring runs there; otherwise the
+# pure-Python bm25 / boolean_vsm modules are used. Fusion (below) is the same
+# cheap rank merge either way.
+_NATIVE = None
+
+
 def build(index: InvertedIndex) -> None:
-    """Called from retrieve.load_index(). Just prepares the two underlying
-    scorers against the same loaded index; RRF needs no state of its own."""
+    """Python-path setup: prepare the two pure-Python scorers against the
+    loaded index. Called from retrieve.load_index() when the native
+    extension isn't available."""
     bm25.build(index)
     boolean_vsm.build(index)
+
+
+def build_native(index_dir: str) -> None:
+    """Native-path setup: construct the C++ index directly from index_dir.
+    No Python InvertedIndex is built — the C++ side owns the postings and
+    does BM25/VSM scoring itself."""
+    global _NATIVE
+    from submission._index_cpp import NativeIndex
+
+    _NATIVE = NativeIndex(index_dir)
 
 
 def _ranks(hits: List[Tuple[str, float]]) -> dict:
@@ -49,10 +66,19 @@ def _ranks(hits: List[Tuple[str, float]]) -> dict:
 
 
 def score(query: str, k: int) -> List[Tuple[str, float]]:
-    """Return up to k (doc_id, rrf_score) pairs for `query`, best first."""
-    bm_ranks = _ranks(bm25.score(query, _CAND, k1=BM25_K1, b=BM25_B))
-    vs_ranks = _ranks(boolean_vsm.vsm_score(query, _CAND))
+    """Return up to k (doc_id, rrf_score) pairs for `query`, best first.
+    BM25/VSM come from the native index when present, else from the Python
+    scorers; the weighted-RRF fusion is identical either way."""
+    if _NATIVE is not None:
+        tokens = tokenize(query)
+        bm_hits = _NATIVE.bm25(tokens, BM25_K1, BM25_B, _CAND)
+        vs_hits = _NATIVE.vsm(tokens, _CAND)
+    else:
+        bm_hits = bm25.score(query, _CAND, k1=BM25_K1, b=BM25_B)
+        vs_hits = boolean_vsm.vsm_score(query, _CAND)
 
+    bm_ranks = _ranks(bm_hits)
+    vs_ranks = _ranks(vs_hits)
     fused = {}
     for doc_id, r in bm_ranks.items():
         fused[doc_id] = fused.get(doc_id, 0.0) + W_BM / (RRF_K + r)
