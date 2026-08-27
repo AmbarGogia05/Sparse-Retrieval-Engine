@@ -18,13 +18,14 @@ from submission.indexer import InvertedIndex
 from submission import bm25
 from submission import boolean_vsm
 
-# Reciprocal Rank Fusion of BM25 and VSM. Chosen over a tuned linear
-# combination because it is scale-free (fuses ranks, not the mismatched
-# BM25 / cosine magnitudes) and parameter-free (k is a fixed convention),
-# so there is nothing fitted on the 50 dev queries to overfit. On the dev
-# set it scored nDCG@10 0.6405 vs BM25-alone 0.5900 (+0.0505). See
+# Weighted Reciprocal Rank Fusion of BM25 and VSM: chosen over a tuned
+# linear combination because it is scale-free (fuses ranks, not the
+# mismatched BM25 / cosine magnitudes). The single weight W_BM tilts the
+# blend toward the stronger retriever (BM25); a dev sweep peaked at 0.6
+# (nDCG@10 0.6453 vs plain-RRF 0.6405 vs BM25-alone 0.5900). See
 # scripts/fuse_scores.py and runs/fusion_results.json.
 RRF_K = 60
+W_BM = 0.6  # weight on BM25's rank term; VSM gets (1 - W_BM)
 BM25_K1 = 1.8
 BM25_B = 0.6
 
@@ -54,8 +55,8 @@ def score(query: str, k: int) -> List[Tuple[str, float]]:
 
     fused = {}
     for doc_id, r in bm_ranks.items():
-        fused[doc_id] = fused.get(doc_id, 0.0) + 1.0 / (RRF_K + r)
+        fused[doc_id] = fused.get(doc_id, 0.0) + W_BM / (RRF_K + r)
     for doc_id, r in vs_ranks.items():
-        fused[doc_id] = fused.get(doc_id, 0.0) + 1.0 / (RRF_K + r)
+        fused[doc_id] = fused.get(doc_id, 0.0) + (1 - W_BM) / (RRF_K + r)
 
     return sorted(fused.items(), key=lambda x: x[1], reverse=True)[:k]

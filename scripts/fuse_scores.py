@@ -44,6 +44,7 @@ from harness.metrics import ndcg_at_k
 random.seed(42)
 
 ALPHAS = [round(0.1 * i, 1) for i in range(11)]  # 0.0 .. 1.0
+WEIGHTS = [round(0.1 * i, 1) for i in range(11)]  # weighted-RRF w on BM25
 N_BOOT = 1000
 RRF_K = 60
 
@@ -89,20 +90,26 @@ def ranking_linear(per_doc, alpha):
     return [d for d, _ in fused]
 
 
-def ranking_rrf(per_doc, k=RRF_K):
-    """Sum of 1/(k + rank) across the two retrievers' rankings."""
+def ranking_wrrf(per_doc, w, k=RRF_K):
+    """Weighted RRF: w * 1/(k+rank_bm25) + (1-w) * 1/(k+rank_vsm).
+    w=0.5 is plain (unweighted) RRF; w=1 is BM25-by-rank, w=0 is VSM-by-rank."""
     bm_rank = {d: i for i, d in enumerate(ranking_by_score(per_doc, "bm25"), 1)}
     vs_rank = {d: i for i, d in enumerate(ranking_by_score(per_doc, "vsm"), 1)}
     fused = []
     for doc_id in per_doc:
         score = 0.0
         if doc_id in bm_rank:
-            score += 1.0 / (k + bm_rank[doc_id])
+            score += w * 1.0 / (k + bm_rank[doc_id])
         if doc_id in vs_rank:
-            score += 1.0 / (k + vs_rank[doc_id])
+            score += (1 - w) * 1.0 / (k + vs_rank[doc_id])
         fused.append((doc_id, score))
     fused.sort(key=lambda x: x[1], reverse=True)
     return [d for d, _ in fused]
+
+
+def ranking_rrf(per_doc, k=RRF_K):
+    """Plain RRF: the w=0.5 case of weighted RRF."""
+    return ranking_wrrf(per_doc, 0.5, k)
 
 
 def per_query_scores(ranking_fn, cache, qrels, qids):
@@ -144,6 +151,8 @@ def main():
     }
     for a in ALPHAS:
         schemes[f"linear(a={a})"] = lambda pd, a=a: ranking_linear(pd, a)
+    for w in WEIGHTS:
+        schemes[f"wrrf(w={w})"] = lambda pd, w=w: ranking_wrrf(pd, w)
 
     # Score every scheme (mean nDCG@10 over all queries).
     pq = {name: per_query_scores(fn, cache, qrels, qids) for name, fn in schemes.items()}
