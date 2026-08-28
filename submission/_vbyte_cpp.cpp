@@ -19,8 +19,25 @@
 
 namespace py = pybind11;
 
+static long read_vbyte(const unsigned char *p, size_t &pos) {
+    long n = 0;
+    int shift = 0;
+    unsigned char b;
+    do {
+        b = p[pos++];
+        n |= static_cast<long>(b & 0x7F) << shift;
+        shift += 7;
+    } while (!(b & 0x80));
+    return n;
+}
+
 // VByte convention (matches indexer._vbyte_encode): 7 bits per byte, the
 // high bit (0x80) is set on the final byte of each number.
+//
+// A1 codec (matches indexer._encode_postings / _spimi_cpp.cpp's
+// put_postings): a posting list is `df` codes (`gap*2 + (tf>1 ? 1 : 0)`)
+// followed by ONLY the tfs for postings whose flag bit is set — a tf==1
+// posting costs zero tf bytes.
 static std::vector<std::pair<std::vector<long>, std::vector<long>>>
 decode_all(const std::string &data, const std::vector<int> &dfs) {
     std::vector<std::pair<std::vector<long>, std::vector<long>>> out;
@@ -32,35 +49,23 @@ decode_all(const std::string &data, const std::vector<int> &dfs) {
     for (int df : dfs) {
         std::vector<long> ords;
         std::vector<long> tfs;
+        std::vector<unsigned char> flags;
         ords.reserve(df);
         tfs.reserve(df);
+        flags.reserve(df);
 
-        // Gaps -> absolute ordinals.
+        // Codes -> absolute ordinals + flag bits.
         long cur = 0;
         for (int i = 0; i < df; i++) {
-            long n = 0;
-            int shift = 0;
-            unsigned char b;
-            do {
-                b = p[pos++];
-                n |= static_cast<long>(b & 0x7F) << shift;
-                shift += 7;
-            } while (!(b & 0x80));
-            cur = (i == 0) ? n : cur + n;
+            long code = read_vbyte(p, pos);
+            long gap = code >> 1;
+            flags.push_back(static_cast<unsigned char>(code & 1));
+            cur = (i == 0) ? gap : cur + gap;
             ords.push_back(cur);
         }
-        // Term frequencies.
-        for (int i = 0; i < df; i++) {
-            long n = 0;
-            int shift = 0;
-            unsigned char b;
-            do {
-                b = p[pos++];
-                n |= static_cast<long>(b & 0x7F) << shift;
-                shift += 7;
-            } while (!(b & 0x80));
-            tfs.push_back(n);
-        }
+        // Term frequencies: only for flagged postings; tf==1 elsewhere.
+        for (int i = 0; i < df; i++)
+            tfs.push_back(flags[i] ? read_vbyte(p, pos) : 1L);
         out.emplace_back(std::move(ords), std::move(tfs));
     }
     return out;

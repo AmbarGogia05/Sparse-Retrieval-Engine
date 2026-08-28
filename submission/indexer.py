@@ -229,6 +229,46 @@ def _vbyte_encode(nums: List[int]) -> bytes:
     return bytes(out)
 
 
+# A1: fold "tf == 1" into the gap. A posting list (ascending absolute ords,
+# parallel tfs) encodes as: `count` codes (`gap*2 + (tf>1 ? 1 : 0)`), then
+# ONLY the tfs for postings whose flag bit is set — a tf==1 posting (73.7%
+# of postings in this corpus) costs zero tf bytes. Shared by postings.bin
+# (ords = doc ordinals) and forward.bin (ords = term ordinals): same shape
+# of problem, same codec. Must match submission/_spimi_cpp.cpp's
+# put_postings/get_postings and _index_cpp.cpp's get_postings exactly, since
+# whichever builder/reader is active must agree on the bytes.
+def _encode_postings(ords: List[int], tfs: List[int]) -> bytes:
+    codes = []
+    prev = 0
+    for i, o in enumerate(ords):
+        gap = o if i == 0 else o - prev
+        prev = o
+        codes.append(gap * 2 + (1 if tfs[i] > 1 else 0))
+    out = bytearray(_vbyte_encode(codes))
+    out += _vbyte_encode([tf for tf in tfs if tf > 1])
+    return bytes(out)
+
+
+def _decode_postings(data: bytes, pos: int, df: int) -> Tuple[List[int], List[int], int]:
+    codes, pos = _vbyte_decode_n(data, pos, df)
+    flags = [c & 1 for c in codes]
+    tf_vals, pos = _vbyte_decode_n(data, pos, sum(flags))
+    ords = []
+    tfs = []
+    cur = 0
+    ti = 0
+    for i, c in enumerate(codes):
+        gap = c >> 1
+        cur = gap if i == 0 else cur + gap
+        ords.append(cur)
+        if flags[i]:
+            tfs.append(tf_vals[ti])
+            ti += 1
+        else:
+            tfs.append(1)
+    return ords, tfs, pos
+
+
 def _vbyte_decode_n(data: bytes, pos: int, count: int) -> Tuple[List[int], int]:
     """Decode `count` VByte numbers from `data` starting at `pos`.
     Returns (numbers, new_pos)."""
@@ -264,13 +304,7 @@ def _decode_all(blob: bytes, dfs: List[int]):
     out = []
     pos = 0
     for df in dfs:
-        gaps, pos = _vbyte_decode_n(blob, pos, df)
-        tfs, pos = _vbyte_decode_n(blob, pos, df)
-        ords = []
-        cur = 0
-        for i, g in enumerate(gaps):
-            cur = g if i == 0 else cur + g
-            ords.append(cur)
+        ords, tfs, pos = _decode_postings(blob, pos, df)
         out.append((ords, tfs))
     return out
 
@@ -409,21 +443,35 @@ class InvertedIndex:
             del self.postings[term]
 
         # Assign an integer ordinal to every doc (build order).
+        # A4: docs.txt holds ONLY verbatim doc-id lines (doc_id strings must
+        # survive verbatim — they're matched against qrels); lengths move to
+        # their own VByte stream, doclen.bin, in the same doc order.
         docid_to_ord = {}
         with open(f"{index_dir}/docs.txt", "w") as f:
-            for doc_id, dl in self.doc_len.items():
+            for doc_id in self.doc_len:
                 docid_to_ord[doc_id] = len(docid_to_ord)
-                f.write(f"{doc_id}\t{dl}\n")
+                f.write(f"{doc_id}\n")
+        with open(f"{index_dir}/doclen.bin", "wb") as f:
+            f.write(_vbyte_encode(list(self.doc_len.values())))
+
+        # A2: assign term ordinals by DESCENDING global df (ties broken by
+        # term string, ascending, for determinism), not by whatever order
+        # self.postings happens to iterate in. Clusters each doc's terms at
+        # low ordinals in the forward index, shrinking its gaps.
+        terms_sorted = sorted(
+            self.postings.keys(),
+            key=lambda t: (-self.document_frequency(t), t),
+        )
+        term_ord = {t: i for i, t in enumerate(terms_sorted)}
 
         term_lines = []
         blob = bytearray()
-        for term, plist in self.postings.items():
+        for term in terms_sorted:
+            plist = self.postings[term]
             items = sorted((docid_to_ord[d], tf) for d, tf in plist.items())
             ords = [o for o, _ in items]
             tfs = [tf for _, tf in items]
-            gaps = [ords[0]] + [ords[i] - ords[i - 1] for i in range(1, len(ords))]
-            blob += _vbyte_encode(gaps)
-            blob += _vbyte_encode(tfs)
+            blob += _encode_postings(ords, tfs)  # A1 codec
             term_lines.append(f"{term}\t{len(ords)}")
 
         with open(f"{index_dir}/terms.txt", "w") as f:
@@ -432,23 +480,22 @@ class InvertedIndex:
             f.write(bytes(blob))
 
         # Forward index (doc -> [(term_ord, tf)]) for RM3 relevance models.
-        # term_ord is the term's position in the self.postings iteration order,
-        # which is exactly terms.txt order == the ids NativeIndex assigns. Same
-        # per-doc format as _spimi_cpp.write_forward: VByte(count) then gap-coded
-        # term-ordinal gaps then tfs, one record per doc in docs.txt order.
+        # term_ord is the term's position in terms_sorted, i.e. terms.txt
+        # order == the ids NativeIndex assigns. Same per-doc format as
+        # _spimi_cpp.write_forward: VByte(count) then A1-coded term-ordinal
+        # postings, one record per doc in docs.txt order.
         forward = {d: [] for d in self.doc_len}
-        for term_ord, (_term, plist) in enumerate(self.postings.items()):
+        for term, plist in self.postings.items():
+            to = term_ord[term]
             for d, tf in plist.items():
-                forward[d].append((term_ord, tf))
+                forward[d].append((to, tf))
         fblob = bytearray()
         for doc_id in self.doc_len:  # docs.txt order
             items = sorted(forward[doc_id])  # ascending term_ord
             ords = [o for o, _ in items]
             tfs = [t for _, t in items]
-            gaps = [ords[0]] + [ords[i] - ords[i - 1] for i in range(1, len(ords))] if ords else []
             fblob += _vbyte_encode([len(ords)])
-            fblob += _vbyte_encode(gaps)
-            fblob += _vbyte_encode(tfs)
+            fblob += _encode_postings(ords, tfs)  # A1 codec
         with open(f"{index_dir}/forward.bin", "wb") as f:
             f.write(bytes(fblob))
 
@@ -470,9 +517,11 @@ class InvertedIndex:
         ord_to_docid = []
         with open(f"{index_dir}/docs.txt") as f:
             for line in f:
-                doc_id, dl = line.rstrip("\n").split("\t")
-                ord_to_docid.append(doc_id)
-                index.doc_len[doc_id] = int(dl)
+                ord_to_docid.append(line.rstrip("\n"))
+        with open(f"{index_dir}/doclen.bin", "rb") as f:
+            lens, _ = _vbyte_decode_n(f.read(), 0, len(ord_to_docid))
+        for doc_id, dl in zip(ord_to_docid, lens):
+            index.doc_len[doc_id] = dl
 
         with open(f"{index_dir}/postings.bin", "rb") as f:
             blob = f.read()

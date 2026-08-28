@@ -25,14 +25,149 @@ _INDEX = None
 # ~40M postings ≈ 1.5 GB accumulator — well within an 8 GB budget alongside
 # the corpus text and interpreter, with headroom for the merge phase. Small
 # corpora (e.g. 171K docs ≈ 17M postings) stay a single in-memory block.
+#
+# The parallel build (see build_index) runs up to 4 of these accumulators
+# concurrently, one per worker process, on the same 8 GB machine — so each
+# worker's threshold is this value divided by the worker count, ~10M
+# postings (~375 MB) per worker. At this corpus's size (~11.5M postings
+# total, so ~2.9M per worker) no flush actually occurs either way; this is
+# insurance against OOM on a larger corpus, not a hot path here.
 _SPIMI_FLUSH_POSTINGS = 40_000_000
+
+# Hard cap, not os.cpu_count(): the grading machine has 4 cores, and local
+# build-time numbers should reflect that rather than this dev machine's
+# core count.
+_BUILD_WORKERS = 4
 
 # Truecase gate threshold; must match InvertedIndex.save_v2's 0.5.
 _CASE_DF_RATIO = 0.5
 
 
+def _doc_line_offsets(corpus_path: str) -> List[int]:
+    """Byte offset of the start of each non-blank line in corpus_path, in
+    file order. Doc ordinal i (as load_corpus/the serial build assigns it)
+    corresponds to offsets[i] — load_corpus also skips blank lines, so a
+    blank line must not consume an ordinal here either."""
+    offsets = []
+    with open(corpus_path, "rb") as f:
+        pos = f.tell()
+        for raw in f:
+            if raw.strip():
+                offsets.append(pos)
+            pos = f.tell()
+    return offsets
+
+
+def _spimi_worker(args):
+    """Runs in a worker process: tokenises and SPIMI-indexes one contiguous,
+    globally-ordinalled slice of the corpus into its own scratch subdir.
+    Returns small metadata only (paths, vocab, counts) — no postings or doc
+    text cross the IPC boundary."""
+    corpus_path, start_byte, n_docs_to_read, start_ord, worker_dir, flush_threshold = args
+    from submission._spimi_cpp import SpimiBuilder
+    from submission.indexer import tokenize_doc
+
+    os.makedirs(worker_dir, exist_ok=True)
+    builder = SpimiBuilder(worker_dir, flush_threshold, start_ord)
+    with open(corpus_path, "rb") as f:
+        f.seek(start_byte)
+        count = 0
+        while count < n_docs_to_read:
+            raw = f.readline()
+            if not raw:
+                break
+            line = raw.decode("utf-8").strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            tokens, doc_len = tokenize_doc(obj["text"])
+            builder.add_document(obj["doc_id"], tokens, doc_len)
+            count += 1
+    builder.close_worker()
+
+    return {
+        "block_files": builder.block_files(),
+        "vocab": builder.vocab(),
+        "docs_txt": builder.docs_path(),
+        "doclen_bin": builder.doclen_path(),
+        "forward_tmp": builder.forward_tmp_path(),
+        "n_docs": builder.n_docs_count(),
+        "total_len": builder.total_len_count(),
+        "case_terms": builder.case_terms(),
+    }
+
+
+def _build_index_parallel(corpus_path: str, index_dir: str) -> bool:
+    """Attempt the 4-worker-process SPIMI build. Returns True on success,
+    False if the parallel path can't be used here (e.g. a sandboxed runner
+    that can't start a process pool) so the caller can fall back to the
+    serial path. Must produce byte-identical output to the serial build —
+    see the extensive comments in _spimi_cpp.cpp's finalize_parallel."""
+    import multiprocessing as mp
+    from submission._spimi_cpp import SpimiBuilder, finalize_parallel  # noqa: F401
+    from submission.indexer import _stem
+
+    offsets = _doc_line_offsets(corpus_path)
+    n = len(offsets)
+    if n == 0:
+        finalize_parallel([], index_dir, {}, _CASE_DF_RATIO)
+        return True
+
+    n_workers = min(_BUILD_WORKERS, n)
+    base, rem = divmod(n, n_workers)
+    worker_flush = max(1, _SPIMI_FLUSH_POSTINGS // _BUILD_WORKERS)
+
+    tasks = []
+    worker_dirs = []
+    start_ord = 0
+    for i in range(n_workers):
+        size = base + (1 if i < rem else 0)
+        worker_dir = os.path.join(index_dir, f"_w{i}")
+        worker_dirs.append(worker_dir)
+        tasks.append((corpus_path, offsets[start_ord], size, start_ord, worker_dir, worker_flush))
+        start_ord += size
+
+    ctx = mp.get_context()
+    with ctx.Pool(processes=n_workers) as pool:
+        results = pool.map(_spimi_worker, tasks)
+
+    all_case_terms = set()
+    for r in results:
+        all_case_terms.update(r["case_terms"])
+    canonical = {t: _stem(t.lower()) for t in all_case_terms}
+
+    finalize_parallel(results, index_dir, canonical, _CASE_DF_RATIO)
+
+    for worker_dir in worker_dirs:
+        try:
+            os.rmdir(worker_dir)
+        except OSError:
+            pass
+    return True
+
+
 def build_index(corpus_path: str, index_dir: str) -> None:
     """Build the index and persist it to `index_dir`. Timed."""
+    # Parallel path: 4 worker processes each tokenise and SPIMI-build their
+    # own contiguous, globally-ordinalled slice of the corpus; the parent
+    # only does the final (single-threaded) k-way merge and write. This is
+    # purely a build-time optimisation — output must be byte-identical to
+    # the serial path below (see finalize_parallel in _spimi_cpp.cpp for how
+    # that's achieved, and _build_index_parallel for the corpus splitting).
+    # Falls back to the serial path if a process pool can't be started here
+    # (e.g. a sandboxed/restricted CI runner) or the C++ extension isn't
+    # built at all.
+    try:
+        if _build_index_parallel(corpus_path, index_dir):
+            return
+    except ImportError:
+        pass
+    except Exception:
+        # Any other failure to stand up the process pool (sandboxed runner,
+        # OS refusing fork/spawn, etc.) — CI conformance matters more than
+        # the speedup, so fall through to the proven serial path below.
+        pass
+
     corpus = load_corpus(corpus_path)
 
     # C++ SPIMI: flushes sorted blocks past a threshold and merges them into

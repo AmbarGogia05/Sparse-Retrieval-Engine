@@ -60,17 +60,44 @@ struct NativeIndex {
         return n;
     }
 
+    // Inverse of _spimi_cpp.cpp's put_postings (A1 codec): `df` codes
+    // (gap*2 + tf>1 flag), then only the tfs for flagged postings.
+    static void get_postings(const unsigned char *p, size_t &pos, long df,
+                              std::vector<int> &ords, std::vector<int> &tfs) {
+        ords.resize(df);
+        tfs.resize(df);
+        std::vector<unsigned char> flags(df);
+        long prev = 0;
+        for (long i = 0; i < df; i++) {
+            long code = vbyte(p, pos);
+            long gap = code >> 1;
+            flags[i] = static_cast<unsigned char>(code & 1);
+            prev = (i == 0) ? gap : prev + gap;
+            ords[i] = static_cast<int>(prev);
+        }
+        for (long i = 0; i < df; i++)
+            tfs[i] = flags[i] ? static_cast<int>(vbyte(p, pos)) : 1;
+    }
+
     void load(const std::string &dir) {
+        // A4: docs.txt now holds ONLY verbatim doc-id lines; lengths live in
+        // the parallel VByte stream doclen.bin, same doc order.
         {
             std::ifstream f(dir + "/docs.txt");
             std::string line;
-            while (std::getline(f, line)) {
-                size_t tab = line.find('\t');
-                docid.push_back(line.substr(0, tab));
-                doc_len.push_back(std::stoi(line.substr(tab + 1)));
-            }
+            while (std::getline(f, line)) docid.push_back(line);
         }
         N = static_cast<int>(docid.size());
+        {
+            std::ifstream f(dir + "/doclen.bin", std::ios::binary);
+            std::ostringstream ss;
+            ss << f.rdbuf();
+            std::string db = ss.str();
+            const unsigned char *dp = reinterpret_cast<const unsigned char *>(db.data());
+            size_t dpos = 0;
+            doc_len.reserve(N);
+            for (int d = 0; d < N; d++) doc_len.push_back(static_cast<int>(vbyte(dp, dpos)));
+        }
         long tot = 0;
         for (int L : doc_len) tot += L;
         avg_doc_len = static_cast<double>(tot) / N;
@@ -106,16 +133,7 @@ struct NativeIndex {
             term_id[terms[ti]] = ti;
             auto &ords = t_ords[ti];
             auto &tfs = t_tfs[ti];
-            ords.reserve(df);
-            tfs.reserve(df);
-            long cur = 0;
-            for (int i = 0; i < df; i++) {
-                long g = vbyte(p, pos);
-                cur = (i == 0) ? g : cur + g;
-                ords.push_back(static_cast<int>(cur));
-            }
-            for (int i = 0; i < df; i++)
-                tfs.push_back(static_cast<int>(vbyte(p, pos)));
+            get_postings(p, pos, df, ords, tfs);  // A1 codec
         }
 
         // VSM document norms: sqrt(sum_t (tf * log(N/df))^2).
@@ -144,14 +162,10 @@ struct NativeIndex {
                     fwd_off.assign(N + 1, 0);
                     for (int d = 0; d < N; d++) {
                         long n = vbyte(fp, fpos);
-                        long prev = 0;
-                        for (long i = 0; i < n; i++) {
-                            long g = vbyte(fp, fpos);
-                            prev = (i == 0) ? g : prev + g;
-                            fwd_terms.push_back(static_cast<int>(prev));
-                        }
-                        for (long i = 0; i < n; i++)
-                            fwd_tfs.push_back(static_cast<int>(vbyte(fp, fpos)));
+                        std::vector<int> ords, tfs;
+                        get_postings(fp, fpos, n, ords, tfs);  // A1 codec
+                        fwd_terms.insert(fwd_terms.end(), ords.begin(), ords.end());
+                        fwd_tfs.insert(fwd_tfs.end(), tfs.begin(), tfs.end());
                         fwd_off[d + 1] = fwd_terms.size();
                     }
                     has_forward = true;
