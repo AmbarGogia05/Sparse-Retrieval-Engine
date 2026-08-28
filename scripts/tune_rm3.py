@@ -11,9 +11,7 @@ Methodology (mirrors tune_bm25.py, and the same overfitting discipline):
      native scorer. Every grid point scores the same postings.
 
   2. Fixed: R = 10 feedback docs (per design), k1/b = 1.8/0.6 (shipped BM25),
-     the 20-word expansion stoplist (blocks high-freq function words from
-     eating expansion slots — this is the ONLY place stopwords enter), and
-     the fusion (RM3-BM25 fused with VSM on the *original* query, weighted RRF
+     and the fusion (RM3-BM25 fused with VSM on the *original* query, weighted RRF
      W_BM=0.6, exactly the shipped fusion with BM25 swapped for RM3-BM25).
 
   3. Swept: M (number of expansion terms) x lambda (anchor weight on the
@@ -43,7 +41,7 @@ import shutil
 import tempfile
 
 from submission import retrieve as R
-from submission.indexer import tokenize, set_case_terms, _stem
+from submission.indexer import tokenize, set_case_terms
 from harness.metrics import ndcg_at_k
 
 # Fixed knobs (see docstring).
@@ -61,10 +59,6 @@ LAMBDA_GRID = [1.0, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]  # 1.0 == plain BM25
 # 20 common English function words for the expansion stoplist, stemmed so they
 # match indexed terms. Deliberately NOT topical (no "covid"/"19") — a frequent
 # topical term has real IDF, a function word does not.
-_STOP_RAW = [
-    "the", "of", "and", "to", "in", "a", "is", "that", "for", "it",
-    "as", "was", "with", "be", "by", "on", "not", "are", "this", "or",
-]
 
 
 def read_queries(path):
@@ -147,7 +141,6 @@ def main():
     with open(os.path.join(index_dir, "meta.json")) as f:
         set_case_terms(set(json.load(f).get("case_terms", [])))
 
-    stop = [_stem(w) for w in _STOP_RAW]
 
     queries = read_queries(args.queries)
     qrels = read_qrels(args.qrels)
@@ -161,7 +154,7 @@ def main():
         for lam in LAMBDA_GRID:
             total = 0.0
             for q in qids:
-                bm = idx.rm3(q_tokens[q], R_FEEDBACK, m, lam, BM25_K1, BM25_B, CAND, stop)
+                bm = idx.rm3(q_tokens[q], R_FEEDBACK, m, lam, BM25_K1, BM25_B, CAND)
                 total += ndcg_at_k([d for d, _ in fuse(bm, vs_cache[q])], qrels[q], k=10)
             grid[(m, lam)] = total / len(qids)
 

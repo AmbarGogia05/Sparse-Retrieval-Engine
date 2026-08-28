@@ -99,55 +99,85 @@ def tokenize_v1(text: str) -> Tuple[List[str], int]:
     return tokens, primary_count
 
 
-# ---------------------------------------------------------------------------
-# Optional experiment toggles (env-driven so the harness's separate build and
-# query subprocesses both see them). Defaults reproduce the shipped regex
-# tokenizer with NO stopword removal, byte-for-byte (tokenize_v1). NLTK
-# stopwords/word_tokenize are both permitted by the assignment.
-#   SRE_STOPWORDS=1  -> drop NLTK English stopwords (matched on the stemmed form)
-#   SRE_NLTK_TOK=1   -> segment with nltk.word_tokenize instead of the regex
-# ---------------------------------------------------------------------------
-_USE_STOPWORDS = os.environ.get("SRE_STOPWORDS") == "1"
-_USE_NLTK_TOK = os.environ.get("SRE_NLTK_TOK") == "1"
+# nltk.corpus.stopwords.words("english") (198 words, NLTK 3.9.x), inlined
+# rather than imported: `pip install -r requirements.txt` installs the nltk
+# package but not its corpora, so the import raises LookupError on a fresh
+# grading container, and build_index() is timed so it must not download.
+# Dev effect: nDCG@10 0.6419 -> 0.6607 pre-RM3, index 84MB -> 69MB, query
+# latency halved.
+_NLTK_STOPWORDS = [
+    "a", "about", "above", "after", "again", "against", "ain", "all",
+    "am", "an", "and", "any", "are", "aren", "aren't", "as", "at", "be",
+    "because", "been", "before", "being", "below", "between", "both",
+    "but", "by", "can", "couldn", "couldn't", "d", "did", "didn",
+    "didn't", "do", "does", "doesn", "doesn't", "doing", "don", "don't",
+    "down", "during", "each", "few", "for", "from", "further", "had",
+    "hadn", "hadn't", "has", "hasn", "hasn't", "have", "haven", "haven't",
+    "having", "he", "he'd", "he'll", "her", "here", "hers", "herself",
+    "he's", "him", "himself", "his", "how", "i", "i'd", "if", "i'll",
+    "i'm", "in", "into", "is", "isn", "isn't", "it", "it'd", "it'll",
+    "it's", "its", "itself", "i've", "just", "ll", "m", "ma", "me",
+    "mightn", "mightn't", "more", "most", "mustn", "mustn't", "my",
+    "myself", "needn", "needn't", "no", "nor", "not", "now", "o", "of",
+    "off", "on", "once", "only", "or", "other", "our", "ours",
+    "ourselves", "out", "over", "own", "re", "s", "same", "shan",
+    "shan't", "she", "she'd", "she'll", "she's", "should", "shouldn",
+    "shouldn't", "should've", "so", "some", "such", "t", "than", "that",
+    "that'll", "the", "their", "theirs", "them", "themselves", "then",
+    "there", "these", "they", "they'd", "they'll", "they're", "they've",
+    "this", "those", "through", "to", "too", "under", "until", "up", "ve",
+    "very", "was", "wasn", "wasn't", "we", "we'd", "we'll", "we're",
+    "were", "weren", "weren't", "we've", "what", "when", "where", "which",
+    "while", "who", "whom", "why", "will", "with", "won", "won't",
+    "wouldn", "wouldn't", "y", "you", "you'd", "you'll", "your", "you're",
+    "yours", "yourself", "yourselves", "you've"
+]
 
-_STEMMED_STOPWORDS: frozenset = frozenset()
-if _USE_STOPWORDS:
-    from nltk.corpus import stopwords as _nltk_stopwords
-    _STEMMED_STOPWORDS = frozenset(_stem(w) for w in _nltk_stopwords.words("english"))
+# _emit_word applies the stoplist to the WHOLE word, so splitting a compound
+# used to leak function words straight into the postings: "state-of-the-art"
+# emitted "of"/"the", leaving df(to)=4473, df(of)=2404 in a supposedly
+# stopword-free index. Parts are now stoplisted too. Peak nDCG@10 by corpus,
+# before -> after: COVID .6836 -> .6829, nfcorpus .3353 -> .3355,
+# fiqa .2230 -> .2248, antique .3315 -> .3318.
+#
+# SRE_HYPH_NUM=1 additionally drops parts that are pure digits or single chars
+# ("19" from covid-19, "2" from SARS-CoV-2). Measured NEGATIVE on dev
+# (-0.0025) and null off-domain, so it is off by default.
+_DROP_DEGENERATE_PARTS = os.environ.get("SRE_HYPH_NUM") == "1" or \
+    os.environ.get("SRE_HYPH") == "1"
 
-_nltk_word_tokenize = None
-if _USE_NLTK_TOK:
-    from nltk.tokenize import word_tokenize as _nltk_word_tokenize
+# Stemmed, because the index stores stems ("having" -> "have").
+_STEMMED_STOPWORDS = frozenset(_stem(w) for w in _NLTK_STOPWORDS)
 
 
 def _iter_words(text: str):
-    """Yield raw word strings from `text` (nltk word tokens when enabled, else
-    the regex matches). nltk tokens with no alphanumeric char are dropped."""
-    if _nltk_word_tokenize is not None:
-        for tok in _nltk_word_tokenize(text):
-            if any(c.isalnum() for c in tok):
-                yield tok
-    else:
-        for m in _WORD_RE.finditer(text):
-            yield m.group()
+    """Yield raw word strings from `text`."""
+    for m in _WORD_RE.finditer(text):
+        yield m.group()
 
 
 def _emit_word(word: str, tokens: List[str]) -> int:
-    """Apply the v1 emission rules to one word, honoring stopword removal.
-    Returns the number of primary tokens emitted (0 if the word is a stopword)."""
+    """v1 emission rules for one word. Returns primary tokens emitted (0 if a
+    stopword), so doc_len excludes them."""
     if "-" in word:
         concat = word.replace("-", "")
         stem = _stem(concat.lower())
-        if _USE_STOPWORDS and stem in _STEMMED_STOPWORDS:
+        if stem in _STEMMED_STOPWORDS:
             return 0
         tokens.append(stem)
         if _is_case_candidate(concat):
             tokens.append(concat)
         for part in word.split("-"):
-            tokens.append(_stem(part.lower()))
+            low = part.lower()
+            if _DROP_DEGENERATE_PARTS and (len(low) < 2 or low.isdigit()):
+                continue
+            pstem = _stem(low)
+            if pstem in _STEMMED_STOPWORDS:
+                continue
+            tokens.append(pstem)
         return 1
     stem = _stem(word.lower())
-    if _USE_STOPWORDS and stem in _STEMMED_STOPWORDS:
+    if stem in _STEMMED_STOPWORDS:
         return 0
     tokens.append(stem)
     if _is_case_candidate(word):
@@ -156,9 +186,7 @@ def _emit_word(word: str, tokens: List[str]) -> int:
 
 
 def tokenize_v2(text: str) -> Tuple[List[str], int]:
-    """Like tokenize_v1 but routed through _iter_words/_emit_word so the NLTK
-    tokenizer and stopword-removal toggles apply. With both toggles off it
-    yields the same tokens as tokenize_v1."""
+    """Shipped tokenizer: v1's emission rules plus stopword removal."""
     tokens: List[str] = []
     primary = 0
     for word in _iter_words(text):
@@ -167,11 +195,8 @@ def tokenize_v2(text: str) -> Tuple[List[str], int]:
 
 
 def tokenize_doc(text: str) -> Tuple[List[str], int]:
-    """Tokeniser used by the index builder AND query path. Picks v2 when any
-    toggle is active, else the untouched v1."""
-    if _USE_STOPWORDS or _USE_NLTK_TOK:
-        return tokenize_v2(text)
-    return tokenize_v1(text)
+    """Tokeniser used by the index builder AND the query path."""
+    return tokenize_v2(text)
 
 
 def tokenize(text: str) -> List[str]:

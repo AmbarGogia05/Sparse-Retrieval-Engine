@@ -262,13 +262,13 @@ struct NativeIndex {
 
     // RM3 pseudo-relevance feedback. Round 1: BM25 top-R feedback docs. Build a
     // relevance model P(w|R) = sum_d P(d|q) * tf(w,d)/|d| over those docs (using
-    // the forward index), skipping stopwords, keep the top-M terms. Interpolate
+    // the forward index), keep the top-M terms. Interpolate
     // with the original query model: P(w|q') = lambda*P(w|q0) + (1-lambda)*P(w|R).
     // Round 2: weighted BM25 with that expanded query. Returns top-`cand`
     // (doc_id, score) for fusion, exactly like bm25().
     std::vector<std::pair<std::string, double>>
     rm3(const std::vector<std::string> &tokens, int R, int M, double lambda_,
-        double k1, double b, int cand, const std::vector<std::string> &stopwords) {
+        double k1, double b, int cand) {
         std::vector<std::pair<std::string, double>> empty;
         if (!has_forward) return empty;
 
@@ -300,12 +300,6 @@ struct NativeIndex {
         for (size_t i = 0; i < RR; i++) ssum += items[i].first;
         if (ssum <= 0.0) ssum = 1.0;
 
-        std::unordered_set<int> stop;
-        for (const auto &w : stopwords) {
-            auto it = term_id.find(w);
-            if (it != term_id.end()) stop.insert(it->second);
-        }
-
         // Relevance model.
         std::unordered_map<int, double> rel;
         for (size_t i = 0; i < RR; i++) {
@@ -314,7 +308,6 @@ struct NativeIndex {
             int dl = doc_len[d] > 0 ? doc_len[d] : 1;
             for (size_t j = fwd_off[d]; j < fwd_off[d + 1]; j++) {
                 int tw = fwd_terms[j];
-                if (stop.count(tw)) continue;
                 rel[tw] += pd * (static_cast<double>(fwd_tfs[j]) / dl);
             }
         }
@@ -361,7 +354,7 @@ PYBIND11_MODULE(_index_cpp, m) {
         .def("vsm", &NativeIndex::vsm, py::arg("tokens"), py::arg("k"))
         .def("rm3", &NativeIndex::rm3,
              py::arg("tokens"), py::arg("R"), py::arg("M"), py::arg("lambda_"),
-             py::arg("k1"), py::arg("b"), py::arg("cand"), py::arg("stopwords"))
+             py::arg("k1"), py::arg("b"), py::arg("cand"))
         .def_property_readonly("has_forward",
                                [](const NativeIndex &n) { return n.has_forward; });
 }
