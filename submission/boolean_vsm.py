@@ -65,10 +65,11 @@ def boolean_search(query: str, mode: str = "and") -> List[str]:
         raise ValueError(f"mode must be 'and' or 'or', got {mode}")
     query_tokens = tokenize(query)
     if mode == "and":
+        if not query_tokens:
+            return []
         for token in query_tokens:
             if token not in _INDEX.postings:
                 return []  # no documents contain this term
-        # Start with the set of documents containing the first token
         result_docs = set(_INDEX.postings[query_tokens[0]].keys())
         for token in query_tokens[1:]:
             result_docs.intersection_update(_INDEX.postings[token].keys())
