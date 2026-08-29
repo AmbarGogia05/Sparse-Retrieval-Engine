@@ -30,10 +30,17 @@
 
 namespace py = pybind11;
 
+static const std::string EARLY_PREFIX = "\x01" "early:";
+
+static bool is_early_term(const std::string &term) {
+    return term.compare(0, EARLY_PREFIX.size(), EARLY_PREFIX) == 0;
+}
+
 struct NativeIndex {
     int N = 0;
     double avg_doc_len = 0.0;
     std::vector<std::string> docid;   // ordinal -> doc_id string
+    std::unordered_map<std::string, int> doc_ord;
     std::vector<int> doc_len;         // ordinal -> length
     std::vector<double> doc_norm;     // ordinal -> sqrt(VSM norm)
     std::unordered_map<std::string, int> term_id;
@@ -149,6 +156,7 @@ struct NativeIndex {
             while (std::getline(f, line)) docid.push_back(line);
         }
         N = static_cast<int>(docid.size());
+        for (int d = 0; d < N; d++) doc_ord[docid[d]] = d;
         {
             std::ifstream f(dir + "/doclen.bin", std::ios::binary);
             std::ostringstream ss;
@@ -214,6 +222,7 @@ struct NativeIndex {
         // VSM document norms: sqrt(sum_t (tf * log(N/df))^2).
         doc_norm.assign(N, 0.0);
         for (int ti = 0; ti < T; ti++) {
+            if (is_early_term(terms[ti])) continue;
             double idf = std::log(static_cast<double>(N) / t_df[ti]);
             auto &ords = t_ords[ti];
             auto &tfs = t_tfs[ti];
@@ -239,6 +248,7 @@ struct NativeIndex {
             fwd_off.assign(N + 1, 0);
             // Pass 1: count each doc's terms into fwd_off[d+1].
             for (int ti = 0; ti < T; ti++)
+                if (!is_early_term(terms[ti]))
                 for (int o : t_ords[ti]) fwd_off[o + 1]++;
             // Prefix-sum to start offsets; fwd_off[N] is the total nnz.
             for (int d = 0; d < N; d++) fwd_off[d + 1] += fwd_off[d];
@@ -248,6 +258,7 @@ struct NativeIndex {
             // Pass 2: scatter. cursor[d] walks doc d's slice as we fill it.
             std::vector<size_t> cursor(fwd_off.begin(), fwd_off.end() - 1);
             for (int ti = 0; ti < T; ti++) {
+                if (is_early_term(terms[ti])) continue;
                 const auto &ords = t_ords[ti];
                 const auto &tfs = t_tfs[ti];
                 for (size_t i = 0; i < ords.size(); i++) {
@@ -301,6 +312,56 @@ struct NativeIndex {
     }
 
     std::vector<std::pair<std::string, double>>
+    bm25plus(const std::vector<std::string> &tokens, double k1, double b,
+             int k, double delta) {
+        std::vector<double> score(N, 0.0);
+        std::vector<int> touched;
+        for (const auto &tok : tokens) {
+            auto it = term_id.find(tok);
+            if (it == term_id.end()) continue;
+            int ti = it->second, df = t_df[ti];
+            double idf = std::log((static_cast<double>(N) - df + 0.5) /
+                                  (df + 0.5) + 1.0);
+            auto &ords = t_ords[ti];
+            auto &tfs = t_tfs[ti];
+            for (size_t i = 0; i < ords.size(); i++) {
+                int d = ords[i];
+                double tf = tfs[i];
+                if (score[d] == 0.0) touched.push_back(d);
+                double norm = 1.0 - b + b * doc_len[d] / avg_doc_len;
+                score[d] += idf * ((tf * (k1 + 1.0)) /
+                                   (tf + k1 * norm) + delta);
+            }
+        }
+        return topk(score, touched, k);
+    }
+
+    std::vector<std::pair<std::string, double>>
+    bm25l(const std::vector<std::string> &tokens, double k1, double b, int k) {
+        std::vector<double> score(N, 0.0);
+        std::vector<int> touched;
+        for (const auto &tok : tokens) {
+            auto it = term_id.find(tok);
+            if (it == term_id.end()) continue;
+            int ti = it->second, df = t_df[ti];
+            double idf = std::log((static_cast<double>(N) - df + 0.5) /
+                                  (df + 0.5) + 1.0);
+            auto &ords = t_ords[ti];
+            auto &tfs = t_tfs[ti];
+            for (size_t i = 0; i < ords.size(); i++) {
+                int d = ords[i];
+                double tf = tfs[i];
+                if (score[d] == 0.0) touched.push_back(d);
+                double norm = 1.0 - b + b * doc_len[d] / avg_doc_len;
+                double tf_norm = tf / norm;
+                score[d] += idf * ((k1 + 1.0) * tf_norm /
+                                   (k1 + tf_norm));
+            }
+        }
+        return topk(score, touched, k);
+    }
+
+    std::vector<std::pair<std::string, double>>
     vsm(const std::vector<std::string> &tokens, int k) {
         std::unordered_map<std::string, int> qcount;
         for (const auto &t : tokens) qcount[t]++;
@@ -338,6 +399,65 @@ struct NativeIndex {
         return topk(score, touched, k);
     }
 
+    // Coordination/coverage arm: rank documents by how many distinct query
+    // terms they contain. The optional idf weighting rewards coverage of rare
+    // terms while keeping the signal independent of corpus-specific labels.
+    std::vector<std::pair<std::string, double>>
+    coverage(const std::vector<std::string> &tokens, int k, bool idf_weighted,
+             double idf_power = 1.0) {
+        std::unordered_set<int> seen;
+        std::vector<int> qterms;
+        for (const auto &tok : tokens) {
+            auto it = term_id.find(tok);
+            if (it == term_id.end()) continue;
+            if (seen.insert(it->second).second) qterms.push_back(it->second);
+        }
+        std::vector<std::pair<std::string, double>> empty;
+        if (qterms.empty()) return empty;
+
+        std::vector<double> score(N, 0.0);
+        std::vector<int> touched;
+        for (int ti : qterms) {
+            double w = idf_weighted
+                ? std::pow(std::log(static_cast<double>(N) / t_df[ti]), idf_power)
+                : 1.0;
+            for (int d : t_ords[ti]) {
+                if (score[d] == 0.0) touched.push_back(d);
+                score[d] += w;
+            }
+        }
+        return topk(score, touched, k);
+    }
+
+    // Rank documents by the number of distinct query terms present in the
+    // first 12 raw words. Prefix postings are excluded from normal VSM/RM3
+    // statistics and are addressed only through this method.
+    std::vector<std::pair<std::string, double>>
+    early_match(const std::vector<std::string> &tokens, int k) {
+        std::unordered_set<int> seen;
+        std::vector<int> qterms;
+        for (const auto &tok : tokens) {
+            std::string marker = EARLY_PREFIX + tok;
+            auto it = term_id.find(marker);
+            if (it != term_id.end() && seen.insert(it->second).second)
+                qterms.push_back(it->second);
+        }
+        std::vector<double> score(N, 0.0);
+        std::vector<int> touched;
+        for (int ti : qterms) {
+            for (int d : t_ords[ti]) {
+                if (score[d] == 0.0) touched.push_back(d);
+                score[d] += 1.0;
+            }
+        }
+        return topk(score, touched, k);
+    }
+
+    int document_length(const std::string &id) const {
+        auto it = doc_ord.find(id);
+        return it == doc_ord.end() ? 0 : doc_len[it->second];
+    }
+
     // BM25 scoring of a *weighted* bag of query terms into `score`/`touched`.
     // Each (term id, weight) contributes weight * bm25_term(term, doc).
     void bm25_weighted(const std::vector<std::pair<int, double>> &qterms,
@@ -369,7 +489,11 @@ struct NativeIndex {
     std::vector<std::pair<std::string, double>>
     rm3(const std::vector<std::string> &tokens, int R, int M, double lambda_,
         double k1, double b, int cand,
-        double fb_temp, bool novel_only) {
+        double fb_temp, bool novel_only, double qidf_alpha = 0.0,
+        double k1_round2 = -1.0, double b_round2 = -1.0,
+        double fb_dl_exp = 1.0, double qtf_exp = 1.0,
+        double fb_idf_exp = 0.0, double fb_tf_exp = 1.0,
+        double fb_vsm_weight = 0.0) {
         std::vector<std::pair<std::string, double>> empty;
         if (!has_forward) return empty;
 
@@ -383,7 +507,16 @@ struct NativeIndex {
                 auto it = term_id.find(tok);
                 if (it != term_id.end()) qc[it->second]++;
             }
-            for (auto &kv : qc) q0.push_back({kv.first, static_cast<double>(kv.second)});
+            for (auto &kv : qc) {
+                double qweight = std::pow(static_cast<double>(kv.second), qtf_exp);
+                if (qidf_alpha != 0.0) {
+                    double idf = std::log(
+                        (static_cast<double>(N) - t_df[kv.first] + 0.5)
+                        / (t_df[kv.first] + 0.5) + 1.0);
+                    qweight *= std::pow(std::max(idf, 1e-12), qidf_alpha);
+                }
+                q0.push_back({kv.first, qweight});
+            }
         }
         bm25_weighted(q0, k1, b, score, touched);
 
@@ -392,21 +525,48 @@ struct NativeIndex {
         items.reserve(touched.size());
         for (int d : touched) items.push_back({score[d], d});
         size_t RR = std::min(static_cast<size_t>(R), items.size());
-        std::partial_sort(
-            items.begin(), items.begin() + RR, items.end(),
-            [](const std::pair<double, int> &a, const std::pair<double, int> &b) {
-                return a.first > b.first || (a.first == b.first && a.second < b.second);
-            });
+        auto by_score = [](const std::pair<double, int> &a,
+                           const std::pair<double, int> &b) {
+            return a.first > b.first || (a.first == b.first && a.second < b.second);
+        };
+        if (fb_vsm_weight <= 0.0) {
+            std::partial_sort(items.begin(), items.begin() + RR, items.end(), by_score);
+        } else {
+            // Use the top candidate-depth BM25 docs and mix their BM25 and
+            // original-query VSM ranks for pseudo-relevance selection.
+            size_t DD = std::min(static_cast<size_t>(cand), items.size());
+            std::partial_sort(items.begin(), items.begin() + DD, items.end(), by_score);
+            std::unordered_map<int, int> vrank;
+            auto vhits = vsm(tokens, cand);
+            for (size_t i = 0; i < vhits.size(); i++) {
+                auto dit = doc_ord.find(vhits[i].first);
+                if (dit != doc_ord.end()) vrank[dit->second] = static_cast<int>(i + 1);
+            }
+            std::vector<std::pair<double, int>> mixed;
+            mixed.reserve(DD);
+            for (size_t i = 0; i < DD; i++) {
+                int d = items[i].second;
+                double br = 1.0 / (60.0 + static_cast<double>(i + 1));
+                auto it = vrank.find(d);
+                double vr = it == vrank.end()
+                    ? 0.0
+                    : 1.0 / (60.0 + static_cast<double>(it->second));
+                mixed.push_back({(1.0 - fb_vsm_weight) * br +
+                                 fb_vsm_weight * vr, d});
+            }
+            std::partial_sort(mixed.begin(), mixed.begin() + RR, mixed.end(), by_score);
+            items.swap(mixed);
+        }
         // Feedback-doc weights P(d|q): softmax of the BM25 score normalised by
         // the top score, temperature fb_temp. Dividing by smax makes the
         // weights scale-free, so one corpus's larger BM25 magnitudes don't
         // sharpen the distribution relative to another's. Raw score/sum lets a
         // single anomalous top document dominate the relevance model.
         std::vector<double> fbw(RR, 0.0);
-        double smax = RR > 0 ? items[0].first : 1.0;
+        double smax = RR > 0 ? score[items[0].second] : 1.0;
         if (smax <= 0.0) smax = 1.0;
         for (size_t i = 0; i < RR; i++)
-            fbw[i] = std::exp((items[i].first / smax - 1.0) / fb_temp);
+            fbw[i] = std::exp((score[items[i].second] / smax - 1.0) / fb_temp);
         double ssum = 0.0;
         for (size_t i = 0; i < RR; i++) ssum += fbw[i];
         if (ssum <= 0.0) ssum = 1.0;
@@ -429,7 +589,11 @@ struct NativeIndex {
             for (size_t j = fwd_off[d]; j < fwd_off[d + 1]; j++) {
                 int tw = fwd_terms[j];
                 if (novel_only && q0set.count(tw)) continue;
-                rel[tw] += pd * (static_cast<double>(fwd_tfs[j]) / dl);
+                double term_idf = std::log(
+                    static_cast<double>(N) / t_df[tw]);
+                rel[tw] += pd * (std::pow(static_cast<double>(fwd_tfs[j]), fb_tf_exp) /
+                                  std::pow(static_cast<double>(dl), fb_dl_exp)) *
+                           std::pow(std::max(term_idf, 1e-12), fb_idf_exp);
             }
         }
 
@@ -461,7 +625,9 @@ struct NativeIndex {
         // Round 2 weighted BM25.
         std::fill(score.begin(), score.end(), 0.0);
         touched.clear();
-        bm25_weighted(qexp, k1, b, score, touched);
+        double rk1 = k1_round2 > 0.0 ? k1_round2 : k1;
+        double rb = b_round2 >= 0.0 ? b_round2 : b;
+        bm25_weighted(qexp, rk1, rb, score, touched);
         return topk(score, touched, cand);
     }
 
@@ -476,12 +642,14 @@ struct NativeIndex {
               std::vector<std::pair<std::string, double>>>
     arms(const std::vector<std::string> &tokens, bool use_rm3,
          int R, int M, double lambda_, double k1, double b, int cand,
-         double fb_temp, bool novel_only) {
+         double fb_temp, bool novel_only,
+         double k1_round2 = -1.0, double b_round2 = -1.0) {
         std::vector<std::pair<std::string, double>> vs_hits;
         std::thread vt([&] { vs_hits = vsm(tokens, cand); });
         std::vector<std::pair<std::string, double>> bm_hits =
             (use_rm3 && has_forward)
-                ? rm3(tokens, R, M, lambda_, k1, b, cand, fb_temp, novel_only)
+                ? rm3(tokens, R, M, lambda_, k1, b, cand, fb_temp, novel_only,
+                     0.0, k1_round2, b_round2)
                 : bm25(tokens, k1, b, cand);
         vt.join();
         return {bm_hits, vs_hits};
@@ -494,15 +662,37 @@ PYBIND11_MODULE(_index_cpp, m) {
         .def(py::init<const std::string &>())
         .def("bm25", &NativeIndex::bm25,
              py::arg("tokens"), py::arg("k1"), py::arg("b"), py::arg("k"))
+        .def("bm25plus", &NativeIndex::bm25plus,
+             py::arg("tokens"), py::arg("k1"), py::arg("b"), py::arg("k"),
+             py::arg("delta"))
+        .def("bm25l", &NativeIndex::bm25l,
+             py::arg("tokens"), py::arg("k1"), py::arg("b"), py::arg("k"))
+        .def("coverage", &NativeIndex::coverage,
+             py::arg("tokens"), py::arg("k"), py::arg("idf_weighted"),
+             py::arg("idf_power") = 1.0)
+        .def("early_match", &NativeIndex::early_match,
+             py::arg("tokens"), py::arg("k"))
+        .def("document_length", &NativeIndex::document_length,
+             py::arg("doc_id"))
         .def("vsm", &NativeIndex::vsm, py::arg("tokens"), py::arg("k"))
         .def("rm3", &NativeIndex::rm3,
              py::arg("tokens"), py::arg("R"), py::arg("M"), py::arg("lambda_"),
              py::arg("k1"), py::arg("b"), py::arg("cand"),
-             py::arg("fb_temp"), py::arg("novel_only"))
+             py::arg("fb_temp"), py::arg("novel_only"),
+             py::arg("qidf_alpha") = 0.0,
+             py::arg("k1_round2") = -1.0,
+             py::arg("b_round2") = -1.0,
+             py::arg("fb_dl_exp") = 1.0,
+             py::arg("qtf_exp") = 1.0,
+             py::arg("fb_idf_exp") = 0.0,
+             py::arg("fb_tf_exp") = 1.0,
+             py::arg("fb_vsm_weight") = 0.0)
         .def("arms", &NativeIndex::arms,
              py::arg("tokens"), py::arg("use_rm3"), py::arg("R"), py::arg("M"),
              py::arg("lambda_"), py::arg("k1"), py::arg("b"), py::arg("cand"),
              py::arg("fb_temp"), py::arg("novel_only"),
+             py::arg("k1_round2") = -1.0,
+             py::arg("b_round2") = -1.0,
              py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("has_forward",
                                [](const NativeIndex &n) { return n.has_forward; });

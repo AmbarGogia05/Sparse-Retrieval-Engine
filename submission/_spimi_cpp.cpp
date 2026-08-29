@@ -30,10 +30,17 @@
 #include <iterator>
 #include <cstdint>
 #include <cmath>
+#include <cctype>
 #include <iomanip>
 #include <limits>
 
 namespace py = pybind11;
+
+static const std::string EARLY_PREFIX = "\x01" "early:";
+
+static bool is_early_term(const std::string &term) {
+    return term.compare(0, EARLY_PREFIX.size(), EARLY_PREFIX) == 0;
+}
 
 static void put_vbyte(std::string &out, long n) {
     while (true) {
@@ -259,6 +266,7 @@ struct SpimiBuilder {
     // reusable token buffer, so add_document_from_text allocates no Python list.
     Tokenizer tok;
     std::vector<std::string> tok_buf;
+    std::vector<std::string> early_buf;
 
     SpimiBuilder(const std::string &d, size_t threshold, uint32_t start_ord = 0)
         : dir(d), flush_threshold(threshold), n_docs(start_ord), docs_out(d + "/docs.txt"),
@@ -291,7 +299,12 @@ struct SpimiBuilder {
         total_len += doc_len;
 
         std::unordered_map<std::string, uint32_t> tf;
+        std::unordered_map<std::string, uint32_t> early_tf;
         for (const auto &t : tokens) {
+            if (is_early_term(t)) {
+                early_tf[t] = 1;
+                continue;
+            }
             tf[t]++;
             if (has_upper(t)) case_terms_seen.insert(t);
         }
@@ -315,6 +328,14 @@ struct SpimiBuilder {
         for (auto &p : fwd) put_vbyte(rec, p.second);
         fwd_tmp.write(rec.data(), rec.size());
 
+        // Prefix postings are a compact, query-only presence signal. They do
+        // not enter the normal forward index, so VSM/RM3 remain unchanged.
+        for (auto &kv : early_tf) {
+            auto &vec = block[kv.first];
+            vec.push_back({ord, 1});
+            cur_postings++;
+        }
+
         if (cur_postings >= flush_threshold) flush_block();
     }
 
@@ -328,6 +349,26 @@ struct SpimiBuilder {
     // add_document(doc_id, tokenize_doc(text)...).
     void add_document_from_text(const std::string &doc_id, const std::string &text) {
         int doc_len = tok.tokenize(text, tok_buf);
+        // Match the experiment: tokenize the first 12 whitespace-delimited
+        // raw words with the same tokenizer, then store one synthetic posting
+        // per distinct prefix term. The synthetic terms are consumed only by
+        // NativeIndex::early_match().
+        std::string prefix;
+        size_t pos = 0;
+        int words = 0;
+        while (pos < text.size() && words < 12) {
+            while (pos < text.size() &&
+                   std::isspace(static_cast<unsigned char>(text[pos]))) pos++;
+            if (pos >= text.size()) break;
+            size_t begin = pos;
+            while (pos < text.size() &&
+                   !std::isspace(static_cast<unsigned char>(text[pos]))) pos++;
+            if (!prefix.empty()) prefix.push_back(' ');
+            prefix.append(text, begin, pos - begin);
+            words++;
+        }
+        tok.tokenize(prefix, early_buf);
+        for (const auto &t : early_buf) tok_buf.push_back(EARLY_PREFIX + t);
         add_document(doc_id, tok_buf, doc_len);
     }
 
@@ -424,6 +465,7 @@ struct SpimiBuilder {
         std::unordered_set<std::string> prune, keep_case;
         for (auto &kv : df_all) {
             const std::string &term = kv.first;
+            if (is_early_term(term)) continue;
             if (!has_upper(term)) continue;
             auto ci = canonical.find(term);
             uint32_t cdf = 0;
@@ -486,7 +528,8 @@ struct SpimiBuilder {
             if (prune.count(mterm)) continue;
 
             int fo = final_ord_map[mterm];
-            local_to_final[vocab[mterm]] = fo;
+            auto vi = vocab.find(mterm);
+            if (vi != vocab.end()) local_to_final[vi->second] = fo;
             data[fo].ords = std::move(ords);
             data[fo].tfs = std::move(tfs);
         }
@@ -637,6 +680,7 @@ void finalize_parallel(const py::list &workers, const std::string &out_dir,
     std::unordered_set<std::string> prune, keep_case;
     for (auto &kv : df_all) {
         const std::string &term = kv.first;
+        if (is_early_term(term)) continue;
         if (!SpimiBuilder::has_upper(term)) continue;
         auto ci = canonical.find(term);
         uint32_t cdf = 0;
