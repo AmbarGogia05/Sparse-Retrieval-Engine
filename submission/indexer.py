@@ -35,17 +35,35 @@ from nltk.stem.snowball import SnowballStemmer
 
 _STEMMER = SnowballStemmer("english")
 
-# Snowball stemming dominates build time (~95%), and the tokenizer re-stems
-# every token occurrence — so common words like "the"/"covid" get stemmed
-# millions of times. Memoise on the raw word: identical output, ~5x faster
-# build. The cache is per-process and unbounded (vocab is finite, ~10^5).
+# Native C++ English Snowball (Porter2) stemmer, drop-in for the pure-Python
+# nltk one. It is a line-for-line port of this venv's nltk EnglishStemmer,
+# validated BYTE-IDENTICAL on 441K words (207K corpus vocab + the system
+# dictionary), 0 mismatches — so the index, postings and ranking are unchanged;
+# it is a pure speed win (~11x faster raw stemming). SRE_SNOWBALL=1 forces the
+# pure-Python path (used to prove the two agree). Build and query both go
+# through _stem, so they always use the same stemmer.
+_USE_CPP_STEM = os.environ.get("SRE_SNOWBALL") != "1"
+_cpp_tokenize = None
+_cpp_set_stopword_stems = None
+try:
+    from submission._stem_cpp import stem as _cpp_stem
+    from submission._stem_cpp import tokenize_doc as _cpp_tokenize
+    from submission._stem_cpp import set_stopword_stems as _cpp_set_stopword_stems
+except ImportError:
+    _USE_CPP_STEM = False
+
+# The tokenizer re-stems every token occurrence — so common words like
+# "the"/"covid" get stemmed millions of times. Memoise on the raw word so each
+# unique word is stemmed once (this cache wraps whichever stemmer is active, so
+# the C++ path is memoised too — no second cache is needed inside C++). Per
+# process, unbounded (vocab ~10^5).
 _STEM_CACHE = {}
 
 
 def _stem(word: str) -> str:
     s = _STEM_CACHE.get(word)
     if s is None:
-        s = _STEMMER.stem(word)
+        s = _cpp_stem(word) if _USE_CPP_STEM else _STEMMER.stem(word)
         _STEM_CACHE[word] = s
     return s
 
@@ -149,6 +167,17 @@ _DROP_DEGENERATE_PARTS = os.environ.get("SRE_HYPH_NUM") == "1" or \
 # Stemmed, because the index stores stems ("having" -> "have").
 _STEMMED_STOPWORDS = frozenset(_stem(w) for w in _NLTK_STOPWORDS)
 
+# Use the fused C++ tokenizer (tokenize + stem in one native pass) when the
+# extension is built and the pure-Python stemmer isn't being forced (SRE_SNOWBALL
+# =1) and the experimental degenerate-part drop isn't on (the C++ port implements
+# only the shipped default). It's a byte-for-byte port of tokenize_v2, so output
+# is identical; it just avoids ~11.5M per-token pybind crossings + dict lookups.
+_USE_CPP_TOKENIZE = (
+    _USE_CPP_STEM and _cpp_tokenize is not None and not _DROP_DEGENERATE_PARTS
+)
+if _cpp_set_stopword_stems is not None:
+    _cpp_set_stopword_stems(list(_STEMMED_STOPWORDS))
+
 
 def _iter_words(text: str):
     """Yield raw word strings from `text`."""
@@ -195,7 +224,10 @@ def tokenize_v2(text: str) -> Tuple[List[str], int]:
 
 
 def tokenize_doc(text: str) -> Tuple[List[str], int]:
-    """Tokeniser used by the index builder AND the query path."""
+    """Tokeniser used by the index builder AND the query path. Dispatches to the
+    fused C++ tokenizer when available (byte-identical to tokenize_v2)."""
+    if _USE_CPP_TOKENIZE:
+        return _cpp_tokenize(text)
     return tokenize_v2(text)
 
 
