@@ -44,6 +44,21 @@ static void put_vbyte(std::string &out, long n) {
     }
 }
 
+// Append one front-coded term record to `out` (terms.txt is front-coded and
+// alphabetical): VByte(shared prefix len with prev) VByte(suffix len) suffix
+// VByte(df); updates prev. Mirrors indexer._encode_terms and the terms reader
+// in _index_cpp.cpp.
+static void put_term_frontcoded(std::string &out, std::string &prev,
+                                const std::string &term, long df) {
+    size_t s = 0, mm = std::min(prev.size(), term.size());
+    while (s < mm && prev[s] == term[s]) s++;
+    put_vbyte(out, static_cast<long>(s));
+    put_vbyte(out, static_cast<long>(term.size() - s));
+    out.append(term, s, term.size() - s);
+    put_vbyte(out, df);
+    prev = term;
+}
+
 // Read one VByte from a byte buffer, advancing pos (mirror of put_vbyte).
 static long get_vbyte(const unsigned char *p, size_t &pos) {
     long n = 0;
@@ -82,6 +97,62 @@ static void put_postings(std::string &out, const std::vector<uint32_t> &ords,
     }
     for (size_t i = 0; i < ords.size(); i++)
         if (tfs[i] > 1) put_vbyte(out, static_cast<long>(tfs[i]));
+}
+
+// Elias-Fano encoder for the FINAL postings.bin (the intermediate SPIMI block
+// files keep the simpler put_postings/BlockReader codec above). One posting
+// list of m = ords.size() ascending doc ordinals in [0,N): l = floor(log2(N/m))
+// low bits/value packed LSB-first byte-padded; a unary high stream ((hi-prev)
+// zeros then a 1) byte-padded; then (tf-1) in 128-blocks (width byte + packed).
+// Must stay byte-identical to indexer._encode_postings and _index_cpp
+// NativeIndex::get_postings (which recomputes l from m,N and decodes this).
+static void put_postings_ef(std::string &out, const std::vector<uint32_t> &ords,
+                            const std::vector<uint32_t> &tfs, long N) {
+    long m = static_cast<long>(ords.size());
+    int l = 0;
+    if (m > 0) { long q = N / m; if (q >= 1) { while ((q >> 1) != 0) { q >>= 1; l++; } } }
+    // Low bits.
+    {
+        uint64_t buf = 0; int nb = 0;
+        uint32_t mask = (l > 0) ? ((1u << l) - 1u) : 0u;
+        for (long i = 0; i < m; i++) {
+            buf |= static_cast<uint64_t>(ords[i] & mask) << nb; nb += l;
+            while (nb >= 8) { out.push_back(static_cast<char>(buf & 0xFF)); buf >>= 8; nb -= 8; }
+        }
+        if (nb) out.push_back(static_cast<char>(buf & 0xFF));
+    }
+    // High bits.
+    {
+        uint64_t buf = 0; int nb = 0; uint32_t prev = 0;
+        for (long i = 0; i < m; i++) {
+            uint32_t hi = ords[i] >> l;
+            nb += static_cast<int>(hi - prev);   // (hi-prev) zero bits
+            while (nb >= 8) { out.push_back(static_cast<char>(buf & 0xFF)); buf >>= 8; nb -= 8; }
+            buf |= static_cast<uint64_t>(1) << nb; nb += 1;  // terminating one bit
+            while (nb >= 8) { out.push_back(static_cast<char>(buf & 0xFF)); buf >>= 8; nb -= 8; }
+            prev = hi;
+        }
+        if (nb) out.push_back(static_cast<char>(buf & 0xFF));
+    }
+    // tf-1 in blocks of 128.
+    long done = 0;
+    while (done < m) {
+        long k = std::min(static_cast<long>(128), m - done);
+        uint32_t mx = 0;
+        for (long j = 0; j < k; j++) { uint32_t v = tfs[done + j] - 1; if (v > mx) mx = v; }
+        int width = 0; { uint32_t t = mx; while (t) { t >>= 1; width++; } }
+        out.push_back(static_cast<char>(width));
+        if (width > 0) {
+            uint64_t buf = 0; int nb = 0;
+            uint32_t wmask = (width >= 32) ? 0xFFFFFFFFu : ((1u << width) - 1u);
+            for (long j = 0; j < k; j++) {
+                buf |= static_cast<uint64_t>((tfs[done + j] - 1) & wmask) << nb; nb += width;
+                while (nb >= 8) { out.push_back(static_cast<char>(buf & 0xFF)); buf >>= 8; nb -= 8; }
+            }
+            if (nb) out.push_back(static_cast<char>(buf & 0xFF));
+        }
+        done += k;
+    }
 }
 
 // Decode one worker's forward.tmp (local-id gaps + tfs per doc, written by
@@ -344,21 +415,16 @@ struct SpimiBuilder {
                 prune.insert(term);
         }
 
-        // A2: final term ordinals are assigned by DESCENDING global df (ties
-        // broken by term string, ascending, for determinism), not by the
-        // alphabetical order the merge below happens to visit terms in. This
-        // clusters each document's ~67 distinct terms at low ordinals in the
-        // forward index (mean gap ~4100 -> much smaller), at the cost of one
-        // extra pass. Pruned terms never get an ordinal.
+        // Final term ordinals are assigned ALPHABETICALLY (== the order the
+        // k-way merge below visits terms, and what NativeIndex assigns as ids).
+        // The old A2 df-descending order existed only to shrink forward.bin's
+        // gaps; forward.bin is gone, so alphabetical is free and lets terms.txt
+        // be front-coded. Pruned terms never get an ordinal.
         std::vector<std::string> kept_terms;
         kept_terms.reserve(df_all.size());
         for (auto &kv : df_all)
             if (!prune.count(kv.first)) kept_terms.push_back(kv.first);
-        std::sort(kept_terms.begin(), kept_terms.end(), [&](const std::string &a, const std::string &b) {
-            uint32_t da = df_all[a], db = df_all[b];
-            if (da != db) return da > db;
-            return a < b;
-        });
+        std::sort(kept_terms.begin(), kept_terms.end());
         std::unordered_map<std::string, int> final_ord_map;
         final_ord_map.reserve(kept_terms.size() * 2);
         for (size_t i = 0; i < kept_terms.size(); i++) final_ord_map[kept_terms[i]] = static_cast<int>(i);
@@ -404,13 +470,15 @@ struct SpimiBuilder {
         }
         for (auto *r : readers) delete r;
 
-        std::ofstream terms_out(dir + "/terms.txt");
-        std::string postings;  // buffered, written once
+        std::string terms_blob;   // front-coded, buffered, written once
+        std::string postings;      // buffered, written once
+        std::string prev_term;
         for (size_t i = 0; i < kept_terms.size(); i++) {
-            if (i) terms_out << '\n';
-            terms_out << kept_terms[i] << '\t' << data[i].ords.size();
-            put_postings(postings, data[i].ords, data[i].tfs);  // A1 codec
+            put_term_frontcoded(terms_blob, prev_term, kept_terms[i],
+                                static_cast<long>(data[i].ords.size()));
+            put_postings_ef(postings, data[i].ords, data[i].tfs, static_cast<long>(n_docs));  // Elias-Fano
         }
+        std::ofstream(dir + "/terms.txt", std::ios::binary).write(terms_blob.data(), terms_blob.size());
         std::ofstream(dir + "/postings.bin", std::ios::binary).write(postings.data(), postings.size());
 
         // forward.bin is intentionally NOT written: it is a byte-for-byte
@@ -560,18 +628,14 @@ void finalize_parallel(const py::list &workers, const std::string &out_dir,
             prune.insert(term);
     }
 
-    // A2 (same as the serial path): final ordinals by descending global df,
-    // ties broken by term string ascending — NOT by the alphabetical merge
-    // order below, and NOT by which worker happened to see the term first.
+    // Alphabetical term order (same as the serial path): == the merge order and
+    // the ids NativeIndex assigns, and what front-coded terms.txt requires. The
+    // old A2 df-order only helped the now-removed forward.bin.
     std::vector<std::string> kept_terms;
     kept_terms.reserve(df_all.size());
     for (auto &kv : df_all)
         if (!prune.count(kv.first)) kept_terms.push_back(kv.first);
-    std::sort(kept_terms.begin(), kept_terms.end(), [&](const std::string &a, const std::string &b) {
-        uint32_t da = df_all[a], db = df_all[b];
-        if (da != db) return da > db;
-        return a < b;
-    });
+    std::sort(kept_terms.begin(), kept_terms.end());
     std::unordered_map<std::string, int> final_ord_map;
     final_ord_map.reserve(kept_terms.size() * 2);
     for (size_t i = 0; i < kept_terms.size(); i++) final_ord_map[kept_terms[i]] = static_cast<int>(i);
@@ -617,13 +681,15 @@ void finalize_parallel(const py::list &workers, const std::string &out_dir,
     }
     for (auto *r : readers) delete r;
 
-    std::ofstream terms_out(out_dir + "/terms.txt");
+    std::string terms_blob;   // front-coded, buffered, written once
     std::string postings;
+    std::string prev_term;
     for (size_t i = 0; i < kept_terms.size(); i++) {
-        if (i) terms_out << '\n';
-        terms_out << kept_terms[i] << '\t' << data[i].ords.size();
-        put_postings(postings, data[i].ords, data[i].tfs);  // A1 codec
+        put_term_frontcoded(terms_blob, prev_term, kept_terms[i],
+                            static_cast<long>(data[i].ords.size()));
+        put_postings_ef(postings, data[i].ords, data[i].tfs, static_cast<long>(N));  // Elias-Fano
     }
+    std::ofstream(out_dir + "/terms.txt", std::ios::binary).write(terms_blob.data(), terms_blob.size());
     std::ofstream(out_dir + "/postings.bin", std::ios::binary).write(postings.data(), postings.size());
 
     // forward.bin is intentionally NOT written here (nor in the serial path):

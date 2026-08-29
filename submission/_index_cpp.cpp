@@ -25,6 +25,8 @@
 #include <algorithm>
 #include <fstream>
 #include <sstream>
+#include <cstdint>
+#include <thread>
 
 namespace py = pybind11;
 
@@ -61,23 +63,81 @@ struct NativeIndex {
         return n;
     }
 
-    // Inverse of _spimi_cpp.cpp's put_postings (A1 codec): `df` codes
-    // (gap*2 + tf>1 flag), then only the tfs for flagged postings.
-    static void get_postings(const unsigned char *p, size_t &pos, long df,
-                              std::vector<int> &ords, std::vector<int> &tfs) {
-        ords.resize(df);
-        tfs.resize(df);
-        std::vector<unsigned char> flags(df);
-        long prev = 0;
-        for (long i = 0; i < df; i++) {
-            long code = vbyte(p, pos);
-            long gap = code >> 1;
-            flags[i] = static_cast<unsigned char>(code & 1);
-            prev = (i == 0) ? gap : prev + gap;
-            ords[i] = static_cast<int>(prev);
+    // floor(log2(N/m)) == bit_length(N/m)-1; the Elias-Fano low-bit width.
+    static int ef_l(long m, long N) {
+        if (m <= 0) return 0;
+        long q = N / m;
+        if (q < 1) return 0;
+        int l = 0;
+        while ((q >> 1) != 0) { q >>= 1; l++; }
+        return l;
+    }
+
+    // Inverse of _spimi_cpp.cpp's put_postings_ef / indexer._encode_postings
+    // (Elias-Fano of the monotone doc-ids, then (tf-1) in 128-blocks). See the
+    // codec comment in indexer.py; l is recomputed from (df, N), not stored.
+    static void get_postings(const unsigned char *p, size_t &pos, long df, long N,
+                             std::vector<int> &ords, std::vector<int> &tfs) {
+        long m = df;
+        ords.resize(m);
+        tfs.resize(m);
+        int l = ef_l(m, N);
+        // Low bits: m values of l bits each, LSB-first, byte-padded.
+        std::vector<int> lows(m, 0);
+        if (l > 0) {
+            uint64_t buf = 0;
+            int nb = 0;
+            size_t bi = pos;
+            long lmask = (1L << l) - 1;
+            for (long i = 0; i < m; i++) {
+                while (nb < l) { buf |= static_cast<uint64_t>(p[bi++]) << nb; nb += 8; }
+                lows[i] = static_cast<int>(buf & lmask);
+                buf >>= l;
+                nb -= l;
+            }
         }
-        for (long i = 0; i < df; i++)
-            tfs[i] = flags[i] ? static_cast<int>(vbyte(p, pos)) : 1;
+        pos += static_cast<size_t>((m * static_cast<long>(l) + 7) / 8);
+        // High bits: read bits until m one-bits; each 0 raises the high part.
+        {
+            uint64_t buf = 0;
+            int nb = 0;
+            size_t bi = pos;
+            long cur = 0;
+            long ones = 0;
+            while (ones < m) {
+                if (nb == 0) { buf = p[bi++]; nb = 8; }
+                int bit = static_cast<int>(buf & 1);
+                buf >>= 1;
+                nb--;
+                if (bit) {
+                    ords[ones] = static_cast<int>((cur << l) | static_cast<long>(lows[ones]));
+                    ones++;
+                } else {
+                    cur++;
+                }
+            }
+            pos = bi;  // writer byte-padded the high stream
+        }
+        // tf blocks: (tf-1) in blocks of 128, per block a width byte then packed.
+        long done = 0;
+        while (done < m) {
+            long k = std::min(static_cast<long>(128), m - done);
+            int width = p[pos++];
+            if (width == 0) {
+                for (long j = 0; j < k; j++) tfs[done + j] = 1;
+            } else {
+                uint64_t buf = 0;
+                int nb = 0;
+                long wmask = (1L << width) - 1;
+                for (long j = 0; j < k; j++) {
+                    while (nb < width) { buf |= static_cast<uint64_t>(p[pos++]) << nb; nb += 8; }
+                    tfs[done + j] = static_cast<int>((buf & wmask) + 1);
+                    buf >>= width;
+                    nb -= width;
+                }
+            }
+            done += k;
+        }
     }
 
     void load(const std::string &dir) {
@@ -113,15 +173,29 @@ struct NativeIndex {
         const unsigned char *p = reinterpret_cast<const unsigned char *>(blob.data());
         size_t pos = 0;
 
+        // terms.txt is front-coded (alphabetical): per term VByte(shared prefix
+        // len) VByte(suffix len) suffix VByte(df), reconstructed against the
+        // previous term. Mirrors indexer._decode_terms / _spimi put_term_frontcoded.
         std::vector<std::string> terms;
         std::vector<int> dfs;
         {
-            std::ifstream f(dir + "/terms.txt");
-            std::string line;
-            while (std::getline(f, line)) {
-                size_t tab = line.find('\t');
-                terms.push_back(line.substr(0, tab));
-                dfs.push_back(std::stoi(line.substr(tab + 1)));
+            std::ifstream f(dir + "/terms.txt", std::ios::binary);
+            std::ostringstream ss;
+            ss << f.rdbuf();
+            std::string tb = ss.str();
+            const unsigned char *tp = reinterpret_cast<const unsigned char *>(tb.data());
+            size_t tpos = 0, tn = tb.size();
+            std::string prev;
+            while (tpos < tn) {
+                long shared = vbyte(tp, tpos);
+                long suflen = vbyte(tp, tpos);
+                std::string term = prev.substr(0, static_cast<size_t>(shared));
+                term.append(reinterpret_cast<const char *>(tp + tpos), static_cast<size_t>(suflen));
+                tpos += static_cast<size_t>(suflen);
+                long df = vbyte(tp, tpos);
+                terms.push_back(term);
+                dfs.push_back(static_cast<int>(df));
+                prev = term;
             }
         }
         int T = static_cast<int>(terms.size());
@@ -134,7 +208,7 @@ struct NativeIndex {
             term_id[terms[ti]] = ti;
             auto &ords = t_ords[ti];
             auto &tfs = t_tfs[ti];
-            get_postings(p, pos, df, ords, tfs);  // A1 codec
+            get_postings(p, pos, df, N, ords, tfs);  // Elias-Fano codec
         }
 
         // VSM document norms: sqrt(sum_t (tf * log(N/df))^2).
@@ -390,6 +464,28 @@ struct NativeIndex {
         bm25_weighted(qexp, k1, b, score, touched);
         return topk(score, touched, cand);
     }
+
+    // Run the two fusion arms (RM3-or-BM25 and VSM) concurrently. Both arms
+    // only read shared, immutable arrays (t_ords/t_tfs/doc_len/doc_norm/fwd_*)
+    // and each owns its score/touched buffers, so concurrent reads are safe
+    // with no locking. The VSM arm runs on a worker thread while this thread
+    // runs the (heavier) RM3/BM25 arm. Called with the GIL released (see the
+    // pybind def), so the two C++ threads run truly in parallel. Fusion (RRF)
+    // stays in Python. Returns {bm_hits, vs_hits}.
+    std::pair<std::vector<std::pair<std::string, double>>,
+              std::vector<std::pair<std::string, double>>>
+    arms(const std::vector<std::string> &tokens, bool use_rm3,
+         int R, int M, double lambda_, double k1, double b, int cand,
+         double fb_temp, bool novel_only) {
+        std::vector<std::pair<std::string, double>> vs_hits;
+        std::thread vt([&] { vs_hits = vsm(tokens, cand); });
+        std::vector<std::pair<std::string, double>> bm_hits =
+            (use_rm3 && has_forward)
+                ? rm3(tokens, R, M, lambda_, k1, b, cand, fb_temp, novel_only)
+                : bm25(tokens, k1, b, cand);
+        vt.join();
+        return {bm_hits, vs_hits};
+    }
 };
 
 PYBIND11_MODULE(_index_cpp, m) {
@@ -403,6 +499,11 @@ PYBIND11_MODULE(_index_cpp, m) {
              py::arg("tokens"), py::arg("R"), py::arg("M"), py::arg("lambda_"),
              py::arg("k1"), py::arg("b"), py::arg("cand"),
              py::arg("fb_temp"), py::arg("novel_only"))
+        .def("arms", &NativeIndex::arms,
+             py::arg("tokens"), py::arg("use_rm3"), py::arg("R"), py::arg("M"),
+             py::arg("lambda_"), py::arg("k1"), py::arg("b"), py::arg("cand"),
+             py::arg("fb_temp"), py::arg("novel_only"),
+             py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("has_forward",
                                [](const NativeIndex &n) { return n.has_forward; });
 }

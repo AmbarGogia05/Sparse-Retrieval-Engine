@@ -41,9 +41,12 @@ RM3_LAMBDA = float(os.environ.get("SRE_RM3_LAMBDA", 0.6))
 RM3_FB_TEMP = float(os.environ.get("SRE_RM3_FB_TEMP", 0.15))
 RM3_NOVEL = os.environ.get("SRE_RM3_NOVEL", "1") != "0"
 
-# At RRF_K=60 a doc at rank 1000 contributes 1/1060, far below anything that
-# reaches the top 10 — so fusing top-1000 per arm costs no measurable nDCG@10.
-_CAND = 1000
+# At RRF_K=60 a doc at rank 500 contributes 1/560, far below anything that
+# reaches the fused top 10 — a doc ranked >500 in BOTH arms cannot surface. A
+# dev sweep confirms 500 is byte-identical to 1000 on nDCG@10 (0.6818) while
+# cutting ~0.5ms/query; 450 starts eroding (-0.0013). The bound is RRF math,
+# not a dev artefact, so it holds on the held-out corpus.
+_CAND = 500
 
 
 # Native (C++) index when available, else the pure-Python scorers.
@@ -75,13 +78,12 @@ def score(query: str, k: int) -> List[Tuple[str, float]]:
         tokens = tokenize(query)
         # VSM always scores the ORIGINAL query — the fusion pays for arm
         # disagreement, so expanding both arms would erode the gain.
-        if USE_RM3 and getattr(_NATIVE, "has_forward", False):
-            bm_hits = _NATIVE.rm3(tokens, RM3_R, RM3_M, RM3_LAMBDA,
-                                  BM25_K1, BM25_B, _CAND,
-                                  RM3_FB_TEMP, RM3_NOVEL)
-        else:
-            bm_hits = _NATIVE.bm25(tokens, BM25_K1, BM25_B, _CAND)
-        vs_hits = _NATIVE.vsm(tokens, _CAND)
+        # arms() runs the RM3/BM25 and VSM arms on two C++ threads with the GIL
+        # released, so the cheaper VSM arm hides under the RM3 arm's latency.
+        # The rm3-vs-bm25 choice (USE_RM3 && has_forward) is made inside arms().
+        bm_hits, vs_hits = _NATIVE.arms(
+            tokens, USE_RM3, RM3_R, RM3_M, RM3_LAMBDA,
+            BM25_K1, BM25_B, _CAND, RM3_FB_TEMP, RM3_NOVEL)
     else:
         bm_hits = bm25.score(query, _CAND, k1=BM25_K1, b=BM25_B)
         vs_hits = boolean_vsm.vsm_score(query, _CAND)

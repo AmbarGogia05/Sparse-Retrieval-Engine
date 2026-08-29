@@ -229,43 +229,159 @@ def _vbyte_encode(nums: List[int]) -> bytes:
     return bytes(out)
 
 
-# A1: fold "tf == 1" into the gap. A posting list (ascending absolute ords,
-# parallel tfs) encodes as: `count` codes (`gap*2 + (tf>1 ? 1 : 0)`), then
-# ONLY the tfs for postings whose flag bit is set — a tf==1 posting (73.7%
-# of postings in this corpus) costs zero tf bytes. Shared by postings.bin
-# (ords = doc ordinals) and forward.bin (ords = term ordinals): same shape
-# of problem, same codec. Must match submission/_spimi_cpp.cpp's
-# put_postings/get_postings and _index_cpp.cpp's get_postings exactly, since
-# whichever builder/reader is active must agree on the bytes.
-def _encode_postings(ords: List[int], tfs: List[int]) -> bytes:
-    codes = []
+# Elias-Fano codec for the final postings.bin. A posting list (m = df, doc
+# ordinals strictly ascending in [0, N), parallel tfs >= 1) is stored as
+# EF(ords) then tf blocks:
+#   EF: l = floor(log2(N//m)) low bits per value (0 if N//m < 1). The m low
+#   parts are packed LSB-first, byte-padded; then a high bit-stream where for
+#   each i we write (hi[i]-hi[i-1]) zero bits then a 1 (hi = ord >> l), also
+#   byte-padded. The reader recomputes l from (m, N), so l is NOT stored, and
+#   stops the high stream after m one-bits.
+#   tf blocks: (tf-1) in blocks of 128 — per block one width byte (bits for the
+#   block max) then k*width bits packed LSB-first, byte-padded.
+# Replaces the old VByte+gap "A1" codec: with only 171K docs and a 58%
+# singleton vocabulary, gap coding is near-incompressible, but Elias-Fano of
+# the monotone doc-ids saves ~14% on postings.bin. Must match
+# _spimi_cpp.cpp put_postings_ef and _index_cpp.cpp's EF decoder byte-for-byte.
+_EF_BLOCK = 128
+
+
+def _ef_l(m: int, N: int) -> int:
+    if m <= 0:
+        return 0
+    q = N // m
+    return q.bit_length() - 1 if q >= 1 else 0
+
+
+class _BitW:
+    __slots__ = ("buf", "cur", "n")
+
+    def __init__(self):
+        self.buf = bytearray()
+        self.cur = 0
+        self.n = 0
+
+    def put(self, val: int, bits: int) -> None:
+        self.cur |= (val & ((1 << bits) - 1)) << self.n
+        self.n += bits
+        while self.n >= 8:
+            self.buf.append(self.cur & 0xFF)
+            self.cur >>= 8
+            self.n -= 8
+
+    def flush(self) -> bytes:
+        if self.n:
+            self.buf.append(self.cur & 0xFF)
+            self.cur = 0
+            self.n = 0
+        return bytes(self.buf)
+
+
+class _BitR:
+    __slots__ = ("d", "pos", "cur", "n")
+
+    def __init__(self, data: bytes, pos: int):
+        self.d = data
+        self.pos = pos
+        self.cur = 0
+        self.n = 0
+
+    def get(self, bits: int) -> int:
+        while self.n < bits:
+            self.cur |= self.d[self.pos] << self.n
+            self.pos += 1
+            self.n += 8
+        v = self.cur & ((1 << bits) - 1)
+        self.cur >>= bits
+        self.n -= bits
+        return v
+
+    def get_bit(self) -> int:
+        if self.n == 0:
+            self.cur = self.d[self.pos]
+            self.pos += 1
+            self.n = 8
+        b = self.cur & 1
+        self.cur >>= 1
+        self.n -= 1
+        return b
+
+    def align(self) -> None:
+        self.cur = 0
+        self.n = 0
+
+
+def _pack_blocks(vals: List[int]) -> bytes:
+    w = _BitW()
+    for i in range(0, len(vals), _EF_BLOCK):
+        blk = vals[i:i + _EF_BLOCK]
+        width = (max(blk) if blk else 0).bit_length()
+        w.put(width, 8)
+        for v in blk:
+            w.put(v, width)
+        # byte-align each block so the reader can resync per block
+        if w.n:
+            w.buf.append(w.cur & 0xFF)
+            w.cur = 0
+            w.n = 0
+    return w.flush()
+
+
+def _unpack_blocks(data: bytes, pos: int, m: int) -> Tuple[List[int], int]:
+    r = _BitR(data, pos)
+    out: List[int] = []
+    done = 0
+    while done < m:
+        k = min(_EF_BLOCK, m - done)
+        width = r.get(8)
+        for _ in range(k):
+            out.append(r.get(width) if width else 0)
+        r.align()
+        done += k
+    return out, r.pos
+
+
+def _encode_postings(ords: List[int], tfs: List[int], N: int) -> bytes:
+    m = len(ords)
+    l = _ef_l(m, N)
+    out = bytearray()
+    lw = _BitW()
+    mask = (1 << l) - 1
+    for o in ords:
+        lw.put(o & mask, l)
+    out += lw.flush()
+    hw = _BitW()
     prev = 0
-    for i, o in enumerate(ords):
-        gap = o if i == 0 else o - prev
-        prev = o
-        codes.append(gap * 2 + (1 if tfs[i] > 1 else 0))
-    out = bytearray(_vbyte_encode(codes))
-    out += _vbyte_encode([tf for tf in tfs if tf > 1])
+    for o in ords:
+        hi = o >> l
+        hw.put(0, hi - prev)   # (hi-prev) zero bits
+        hw.put(1, 1)           # terminating one bit
+        prev = hi
+    out += hw.flush()
+    out += _pack_blocks([t - 1 for t in tfs])
     return bytes(out)
 
 
-def _decode_postings(data: bytes, pos: int, df: int) -> Tuple[List[int], List[int], int]:
-    codes, pos = _vbyte_decode_n(data, pos, df)
-    flags = [c & 1 for c in codes]
-    tf_vals, pos = _vbyte_decode_n(data, pos, sum(flags))
-    ords = []
-    tfs = []
+def _decode_postings(data: bytes, pos: int, df: int, N: int) -> Tuple[List[int], List[int], int]:
+    m = df
+    l = _ef_l(m, N)
+    low_bytes = (m * l + 7) // 8
+    lr = _BitR(data, pos)
+    lows = [lr.get(l) if l else 0 for _ in range(m)]
+    pos += low_bytes
+    hr = _BitR(data, pos)
+    ords: List[int] = []
     cur = 0
-    ti = 0
-    for i, c in enumerate(codes):
-        gap = c >> 1
-        cur = gap if i == 0 else cur + gap
-        ords.append(cur)
-        if flags[i]:
-            tfs.append(tf_vals[ti])
-            ti += 1
+    ones = 0
+    while ones < m:
+        if hr.get_bit():
+            ords.append((cur << l) | lows[ones])
+            ones += 1
         else:
-            tfs.append(1)
+            cur += 1
+    hr.align()
+    tfm1, pos = _unpack_blocks(data, hr.pos, m)
+    tfs = [x + 1 for x in tfm1]
     return ords, tfs, pos
 
 
@@ -287,26 +403,55 @@ def _vbyte_decode_n(data: bytes, pos: int, count: int) -> Tuple[List[int], int]:
     return nums, pos
 
 
-# Optional compiled accelerator for the postings decode (see
-# submission/_vbyte_cpp.cpp + setup.py). If it isn't built, we fall back to
-# pure Python — the submission runs either way.
-try:
-    from submission._vbyte_cpp import decode_all as _cpp_decode_all
-except ImportError:
-    _cpp_decode_all = None
-
-
-def _decode_all(blob: bytes, dfs: List[int]):
+def _decode_all(blob: bytes, dfs: List[int], N: int):
     """For each term (given its df, in blob order) return (absolute sorted
-    doc ordinals, term frequencies). Uses the compiled decoder when present."""
-    if _cpp_decode_all is not None:
-        return _cpp_decode_all(bytes(blob), dfs)
+    doc ordinals, term frequencies). This is the pure-Python Elias-Fano decode
+    used only by the load_v2 fallback path (the native _index_cpp reader is used
+    whenever the extension is available)."""
     out = []
     pos = 0
     for df in dfs:
-        ords, tfs, pos = _decode_postings(blob, pos, df)
+        ords, tfs, pos = _decode_postings(blob, pos, df, N)
         out.append((ords, tfs))
     return out
+
+
+# Front-coded terms.txt. Terms are alphabetical, so each shares a prefix with
+# the previous one; store only (shared-prefix length, suffix, df) per term. Ends
+# at EOF (no count stored). Must match _spimi_cpp.cpp write_terms_frontcoded and
+# _index_cpp.cpp's terms reader byte-for-byte.
+def _encode_terms(term_meta: List[Tuple[str, int]]) -> bytes:
+    out = bytearray()
+    prev = ""
+    for term, df in term_meta:
+        s = 0
+        m = min(len(prev), len(term))
+        while s < m and prev[s] == term[s]:
+            s += 1
+        suffix = term[s:].encode("utf-8")
+        out += _vbyte_encode([s, len(suffix)])
+        out += suffix
+        out += _vbyte_encode([df])
+        prev = term
+    return bytes(out)
+
+
+def _decode_terms(data: bytes) -> Tuple[List[str], List[int]]:
+    terms: List[str] = []
+    dfs: List[int] = []
+    pos = 0
+    prev = ""
+    n = len(data)
+    while pos < n:
+        (s, suflen), pos = _vbyte_decode_n(data, pos, 2)
+        suffix = data[pos:pos + suflen].decode("utf-8")
+        pos += suflen
+        (df,), pos = _vbyte_decode_n(data, pos, 1)
+        term = prev[:s] + suffix
+        terms.append(term)
+        dfs.append(df)
+        prev = term
+    return terms, dfs
 
 
 class InvertedIndex:
@@ -454,29 +599,25 @@ class InvertedIndex:
         with open(f"{index_dir}/doclen.bin", "wb") as f:
             f.write(_vbyte_encode(list(self.doc_len.values())))
 
-        # A2: assign term ordinals by DESCENDING global df (ties broken by
-        # term string, ascending, for determinism), not by whatever order
-        # self.postings happens to iterate in. This fixes the terms.txt block
-        # order (== the ids NativeIndex assigns) deterministically; it also
-        # clusters each doc's terms at low ordinals for the forward index that
-        # is reconstructed in RAM at load.
-        terms_sorted = sorted(
-            self.postings.keys(),
-            key=lambda t: (-self.document_frequency(t), t),
-        )
+        # Terms are ordered ALPHABETICALLY (this fixes terms.txt block order ==
+        # the ids NativeIndex assigns, deterministically). The old A2 df-order
+        # existed only to shrink forward.bin's gaps; forward.bin is gone, so
+        # alphabetical order is now free and, crucially, lets terms.txt be
+        # front-coded (adjacent sorted terms share a prefix).
+        terms_sorted = sorted(self.postings.keys())
 
-        term_lines = []
+        term_meta = []  # (term, df)
         blob = bytearray()
         for term in terms_sorted:
             plist = self.postings[term]
             items = sorted((docid_to_ord[d], tf) for d, tf in plist.items())
             ords = [o for o, _ in items]
             tfs = [tf for _, tf in items]
-            blob += _encode_postings(ords, tfs)  # A1 codec
-            term_lines.append(f"{term}\t{len(ords)}")
+            blob += _encode_postings(ords, tfs, self.N)  # Elias-Fano codec
+            term_meta.append((term, len(ords)))
 
-        with open(f"{index_dir}/terms.txt", "w") as f:
-            f.write("\n".join(term_lines))
+        with open(f"{index_dir}/terms.txt", "wb") as f:
+            f.write(_encode_terms(term_meta))
         with open(f"{index_dir}/postings.bin", "wb") as f:
             f.write(bytes(blob))
 
@@ -512,17 +653,10 @@ class InvertedIndex:
 
         with open(f"{index_dir}/postings.bin", "rb") as f:
             blob = f.read()
-        with open(f"{index_dir}/terms.txt") as f:
-            terms_txt = f.read()
+        with open(f"{index_dir}/terms.txt", "rb") as f:
+            terms, dfs = _decode_terms(f.read())
 
-        terms = []
-        dfs = []
-        for line in terms_txt.split("\n") if terms_txt else []:
-            term, df_s = line.split("\t")
-            terms.append(term)
-            dfs.append(int(df_s))
-
-        for term, (ords, tfs) in zip(terms, _decode_all(blob, dfs)):
+        for term, (ords, tfs) in zip(terms, _decode_all(blob, dfs, index.N)):
             index.postings[term] = {
                 ord_to_docid[o]: tf for o, tf in zip(ords, tfs)
             }
