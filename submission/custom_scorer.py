@@ -50,9 +50,9 @@ _CAND = 500
 # ten. The alpha/depth pair was positive on all four probe corpora.
 _COVERAGE_RERANK_ALPHA = 0.30
 _COVERAGE_RERANK_DEPTH = 10
-# Conservative early-document presence tie-breaker. The index stores one
-# synthetic posting per distinct term in the first 12 raw words; the marker is
-# excluded from VSM/RM3 and used only on the existing fused top ten.
+# Conservative early-document presence tie-breaker. Each ordinary posting has
+# one packed bit indicating whether the term occurs in the first 12 raw words;
+# the bit is used only on the existing fused top ten.
 _EARLY_RERANK_ALPHA = 0.05
 
 

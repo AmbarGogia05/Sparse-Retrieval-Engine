@@ -30,12 +30,6 @@
 
 namespace py = pybind11;
 
-static const std::string EARLY_PREFIX = "\x01" "early:";
-
-static bool is_early_term(const std::string &term) {
-    return term.compare(0, EARLY_PREFIX.size(), EARLY_PREFIX) == 0;
-}
-
 struct NativeIndex {
     int N = 0;
     double avg_doc_len = 0.0;
@@ -46,6 +40,7 @@ struct NativeIndex {
     std::unordered_map<std::string, int> term_id;
     std::vector<std::vector<int>> t_ords;  // term -> sorted doc ordinals
     std::vector<std::vector<int>> t_tfs;   // term -> term frequencies
+    std::vector<std::vector<uint8_t>> t_early; // term -> prefix-presence flags
     std::vector<int> t_df;                 // term -> document frequency
 
     // Forward index (CSR): for RM3, doc d's terms are fwd_terms[fwd_off[d] ..
@@ -209,6 +204,7 @@ struct NativeIndex {
         int T = static_cast<int>(terms.size());
         t_ords.resize(T);
         t_tfs.resize(T);
+        t_early.resize(T);
         t_df.resize(T);
         for (int ti = 0; ti < T; ti++) {
             int df = dfs[ti];
@@ -219,10 +215,34 @@ struct NativeIndex {
             get_postings(p, pos, df, N, ords, tfs);  // Elias-Fano codec
         }
 
+        // Optional packed prefix-presence stream: one bit per ordinary posting,
+        // term by term in the same order as terms.txt/postings.bin. Its absence
+        // is valid for older or pure-Python-built indexes and means all-zero.
+        {
+            std::ifstream f(dir + "/early.bin", std::ios::binary);
+            std::ostringstream ss;
+            ss << f.rdbuf();
+            std::string eb = ss.str();
+            const unsigned char *ep =
+                reinterpret_cast<const unsigned char *>(eb.data());
+            size_t epos = 0;
+            for (int ti = 0; ti < T; ti++) {
+                size_t df = static_cast<size_t>(t_df[ti]);
+                auto &flags = t_early[ti];
+                flags.assign(df, 0);
+                size_t bytes = (df + 7) / 8;
+                if (epos + bytes <= eb.size()) {
+                    for (size_t i = 0; i < df; i++)
+                        flags[i] = static_cast<uint8_t>(
+                            (ep[epos + i / 8] >> (i % 8)) & 1u);
+                }
+                epos += bytes;
+            }
+        }
+
         // VSM document norms: sqrt(sum_t (tf * log(N/df))^2).
         doc_norm.assign(N, 0.0);
         for (int ti = 0; ti < T; ti++) {
-            if (is_early_term(terms[ti])) continue;
             double idf = std::log(static_cast<double>(N) / t_df[ti]);
             auto &ords = t_ords[ti];
             auto &tfs = t_tfs[ti];
@@ -248,7 +268,6 @@ struct NativeIndex {
             fwd_off.assign(N + 1, 0);
             // Pass 1: count each doc's terms into fwd_off[d+1].
             for (int ti = 0; ti < T; ti++)
-                if (!is_early_term(terms[ti]))
                 for (int o : t_ords[ti]) fwd_off[o + 1]++;
             // Prefix-sum to start offsets; fwd_off[N] is the total nnz.
             for (int d = 0; d < N; d++) fwd_off[d + 1] += fwd_off[d];
@@ -258,7 +277,6 @@ struct NativeIndex {
             // Pass 2: scatter. cursor[d] walks doc d's slice as we fill it.
             std::vector<size_t> cursor(fwd_off.begin(), fwd_off.end() - 1);
             for (int ti = 0; ti < T; ti++) {
-                if (is_early_term(terms[ti])) continue;
                 const auto &ords = t_ords[ti];
                 const auto &tfs = t_tfs[ti];
                 for (size_t i = 0; i < ords.size(); i++) {
@@ -430,22 +448,24 @@ struct NativeIndex {
     }
 
     // Rank documents by the number of distinct query terms present in the
-    // first 12 raw words. Prefix postings are excluded from normal VSM/RM3
-    // statistics and are addressed only through this method.
+    // first 12 raw words. Each ordinary posting has one aligned packed flag.
     std::vector<std::pair<std::string, double>>
     early_match(const std::vector<std::string> &tokens, int k) {
         std::unordered_set<int> seen;
         std::vector<int> qterms;
         for (const auto &tok : tokens) {
-            std::string marker = EARLY_PREFIX + tok;
-            auto it = term_id.find(marker);
+            auto it = term_id.find(tok);
             if (it != term_id.end() && seen.insert(it->second).second)
                 qterms.push_back(it->second);
         }
         std::vector<double> score(N, 0.0);
         std::vector<int> touched;
         for (int ti : qterms) {
-            for (int d : t_ords[ti]) {
+            auto &ords = t_ords[ti];
+            auto &flags = t_early[ti];
+            for (size_t i = 0; i < ords.size(); i++) {
+                if (i >= flags.size() || !flags[i]) continue;
+                int d = ords[i];
                 if (score[d] == 0.0) touched.push_back(d);
                 score[d] += 1.0;
             }

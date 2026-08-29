@@ -36,6 +36,8 @@
 
 namespace py = pybind11;
 
+// Internal-only marker used to pass prefix terms from the fused tokenizer into
+// add_document(). Marker tokens are never persisted in the vocabulary.
 static const std::string EARLY_PREFIX = "\x01" "early:";
 
 static bool is_early_term(const std::string &term) {
@@ -166,6 +168,24 @@ static void put_postings_ef(std::string &out, const std::vector<uint32_t> &ords,
     }
 }
 
+// Pack one prefix-presence bit per ordinary posting, LSB-first and byte-padded
+// independently for each term. The matching posting-list df tells the decoder
+// exactly how many bits to consume; no per-list header is needed.
+static void put_early_bits(std::string &out, const std::vector<uint8_t> &early) {
+    unsigned char byte = 0;
+    int bit = 0;
+    for (uint8_t flag : early) {
+        if (flag) byte |= static_cast<unsigned char>(1u << bit);
+        bit++;
+        if (bit == 8) {
+            out.push_back(static_cast<char>(byte));
+            byte = 0;
+            bit = 0;
+        }
+    }
+    if (bit != 0) out.push_back(static_cast<char>(byte));
+}
+
 // Decode one worker's forward.tmp (local-id gaps + tfs per doc, written by
 // SpimiBuilder::add_document) and re-encode it with local ids remapped to
 // final (global) term ordinals via local_to_final, dropping pruned terms
@@ -212,12 +232,14 @@ static std::string encode_forward_bytes(const std::string &forward_tmp_path, uin
 }
 
 // A block on disk: records sorted by term, each
-//   [u32 term_len][term bytes][u32 df][df x u32 ord][df x u32 tf]
+//   [u32 term_len][term bytes][u32 df]
+//   [df x u32 ord][df x u32 tf][df x u8 early]
 struct BlockReader {
     std::ifstream f;
     bool ok = false;
     std::string term;
     std::vector<uint32_t> ords, tfs;
+    std::vector<uint8_t> early;
 
     explicit BlockReader(const std::string &path) : f(path, std::ios::binary) { advance(); }
 
@@ -229,8 +251,10 @@ struct BlockReader {
         uint32_t df = rd<uint32_t>(f);
         ords.resize(df);
         tfs.resize(df);
+        early.resize(df);
         f.read(reinterpret_cast<char *>(ords.data()), df * sizeof(uint32_t));
         f.read(reinterpret_cast<char *>(tfs.data()), df * sizeof(uint32_t));
+        f.read(reinterpret_cast<char *>(early.data()), df * sizeof(uint8_t));
         ok = true;
     }
 };
@@ -239,6 +263,7 @@ struct SpimiBuilder {
     std::string dir;
     size_t flush_threshold;
     std::unordered_map<std::string, std::vector<std::pair<uint32_t, uint32_t>>> block;
+    std::unordered_map<std::string, std::vector<uint8_t>> block_early;
     size_t cur_postings = 0;
     uint32_t n_docs = 0;      // next doc gets this ordinal (starts at start_ord)
     uint32_t local_docs = 0;  // number of add_document() calls on THIS instance
@@ -299,10 +324,10 @@ struct SpimiBuilder {
         total_len += doc_len;
 
         std::unordered_map<std::string, uint32_t> tf;
-        std::unordered_map<std::string, uint32_t> early_tf;
+        std::unordered_set<std::string> early_terms;
         for (const auto &t : tokens) {
             if (is_early_term(t)) {
-                early_tf[t] = 1;
+                early_terms.insert(t.substr(EARLY_PREFIX.size()));
                 continue;
             }
             tf[t]++;
@@ -313,6 +338,8 @@ struct SpimiBuilder {
         for (auto &kv : tf) {
             auto &vec = block[kv.first];
             vec.push_back({ord, kv.second});
+            block_early[kv.first].push_back(
+                static_cast<uint8_t>(early_terms.count(kv.first) != 0));
             cur_postings++;
             fwd.push_back({local_id(kv.first), kv.second});
         }
@@ -328,14 +355,6 @@ struct SpimiBuilder {
         for (auto &p : fwd) put_vbyte(rec, p.second);
         fwd_tmp.write(rec.data(), rec.size());
 
-        // Prefix postings are a compact, query-only presence signal. They do
-        // not enter the normal forward index, so VSM/RM3 remain unchanged.
-        for (auto &kv : early_tf) {
-            auto &vec = block[kv.first];
-            vec.push_back({ord, 1});
-            cur_postings++;
-        }
-
         if (cur_postings >= flush_threshold) flush_block();
     }
 
@@ -350,9 +369,9 @@ struct SpimiBuilder {
     void add_document_from_text(const std::string &doc_id, const std::string &text) {
         int doc_len = tok.tokenize(text, tok_buf);
         // Match the experiment: tokenize the first 12 whitespace-delimited
-        // raw words with the same tokenizer, then store one synthetic posting
-        // per distinct prefix term. The synthetic terms are consumed only by
-        // NativeIndex::early_match().
+        // raw words with the same tokenizer. Internal marker tokens let
+        // add_document() set one bit on the corresponding ordinary posting;
+        // the markers themselves never enter the persisted vocabulary.
         std::string prefix;
         size_t pos = 0;
         int words = 0;
@@ -390,8 +409,12 @@ struct SpimiBuilder {
             wr(f, df);
             for (auto &p : vec) wr(f, p.first);
             for (auto &p : vec) wr(f, p.second);
+            auto &early = block_early[term];
+            f.write(reinterpret_cast<const char *>(early.data()),
+                    static_cast<std::streamsize>(early.size()));
         }
         block.clear();
+        block_early.clear();
         cur_postings = 0;
         block_files.push_back(path);
     }
@@ -457,7 +480,9 @@ struct SpimiBuilder {
                 f.read(&term[0], tl);
                 uint32_t df = rd<uint32_t>(f);
                 df_all[term] += df;
-                f.seekg(static_cast<std::streamoff>(df) * 2 * sizeof(uint32_t), std::ios::cur);
+                f.seekg(static_cast<std::streamoff>(df) *
+                        (2 * sizeof(uint32_t) + sizeof(uint8_t)),
+                        std::ios::cur);
             }
         }
 
@@ -465,7 +490,6 @@ struct SpimiBuilder {
         std::unordered_set<std::string> prune, keep_case;
         for (auto &kv : df_all) {
             const std::string &term = kv.first;
-            if (is_early_term(term)) continue;
             if (!has_upper(term)) continue;
             auto ci = canonical.find(term);
             uint32_t cdf = 0;
@@ -499,7 +523,10 @@ struct SpimiBuilder {
         std::vector<BlockReader *> readers;
         for (auto &path : block_files) readers.push_back(new BlockReader(path));
 
-        struct PerTerm { std::vector<uint32_t> ords, tfs; };
+        struct PerTerm {
+            std::vector<uint32_t> ords, tfs;
+            std::vector<uint8_t> early;
+        };
         std::vector<PerTerm> data(kept_terms.size());
 
         // Map each surviving term's local id -> its final ordinal (position in
@@ -518,10 +545,12 @@ struct SpimiBuilder {
 
             // gather postings for mterm from all readers (block order => ascending ords)
             std::vector<uint32_t> ords, tfs;
+            std::vector<uint8_t> early;
             for (auto *r : readers) {
                 if (r->ok && r->term == mterm) {
                     ords.insert(ords.end(), r->ords.begin(), r->ords.end());
                     tfs.insert(tfs.end(), r->tfs.begin(), r->tfs.end());
+                    early.insert(early.end(), r->early.begin(), r->early.end());
                     r->advance();
                 }
             }
@@ -532,19 +561,23 @@ struct SpimiBuilder {
             if (vi != vocab.end()) local_to_final[vi->second] = fo;
             data[fo].ords = std::move(ords);
             data[fo].tfs = std::move(tfs);
+            data[fo].early = std::move(early);
         }
         for (auto *r : readers) delete r;
 
         std::string terms_blob;   // front-coded, buffered, written once
         std::string postings;      // buffered, written once
+        std::string early_bits;    // one packed bit per ordinary posting
         std::string prev_term;
         for (size_t i = 0; i < kept_terms.size(); i++) {
             put_term_frontcoded(terms_blob, prev_term, kept_terms[i],
                                 static_cast<long>(data[i].ords.size()));
             put_postings_ef(postings, data[i].ords, data[i].tfs, static_cast<long>(n_docs));  // Elias-Fano
+            put_early_bits(early_bits, data[i].early);
         }
         std::ofstream(dir + "/terms.txt", std::ios::binary).write(terms_blob.data(), terms_blob.size());
         std::ofstream(dir + "/postings.bin", std::ios::binary).write(postings.data(), postings.size());
+        std::ofstream(dir + "/early.bin", std::ios::binary).write(early_bits.data(), early_bits.size());
 
         // forward.bin is intentionally NOT written: it is a byte-for-byte
         // redundant transpose of postings.bin, and NativeIndex reconstructs the
@@ -668,7 +701,9 @@ void finalize_parallel(const py::list &workers, const std::string &out_dir,
             f.read(&term[0], tl);
             uint32_t df = rd<uint32_t>(f);
             tmp_df[term] += df;
-            f.seekg(static_cast<std::streamoff>(df) * 2 * sizeof(uint32_t), std::ios::cur);
+            f.seekg(static_cast<std::streamoff>(df) *
+                    (2 * sizeof(uint32_t) + sizeof(uint8_t)),
+                    std::ios::cur);
         }
     }
     // ...Pass 1b: insert into the unordered_map in that alphabetical order,
@@ -680,7 +715,6 @@ void finalize_parallel(const py::list &workers, const std::string &out_dir,
     std::unordered_set<std::string> prune, keep_case;
     for (auto &kv : df_all) {
         const std::string &term = kv.first;
-        if (is_early_term(term)) continue;
         if (!SpimiBuilder::has_upper(term)) continue;
         auto ci = canonical.find(term);
         uint32_t cdf = 0;
@@ -714,7 +748,10 @@ void finalize_parallel(const py::list &workers, const std::string &out_dir,
     for (auto &w : ws)
         for (auto &p : w.block_files) readers.push_back(new BlockReader(p));
 
-    struct PerTerm { std::vector<uint32_t> ords, tfs; };
+    struct PerTerm {
+        std::vector<uint32_t> ords, tfs;
+        std::vector<uint8_t> early;
+    };
     std::vector<PerTerm> data(kept_terms.size());
 
     std::vector<std::vector<int>> local_to_final(ws.size());
@@ -728,10 +765,12 @@ void finalize_parallel(const py::list &workers, const std::string &out_dir,
         if (!found) break;
 
         std::vector<uint32_t> ords, tfs;
+        std::vector<uint8_t> early;
         for (auto *r : readers) {
             if (r->ok && r->term == mterm) {
                 ords.insert(ords.end(), r->ords.begin(), r->ords.end());
                 tfs.insert(tfs.end(), r->tfs.begin(), r->tfs.end());
+                early.insert(early.end(), r->early.begin(), r->early.end());
                 r->advance();
             }
         }
@@ -744,19 +783,23 @@ void finalize_parallel(const py::list &workers, const std::string &out_dir,
         }
         data[fo].ords = std::move(ords);
         data[fo].tfs = std::move(tfs);
+        data[fo].early = std::move(early);
     }
     for (auto *r : readers) delete r;
 
     std::string terms_blob;   // front-coded, buffered, written once
     std::string postings;
+    std::string early_bits;
     std::string prev_term;
     for (size_t i = 0; i < kept_terms.size(); i++) {
         put_term_frontcoded(terms_blob, prev_term, kept_terms[i],
                             static_cast<long>(data[i].ords.size()));
         put_postings_ef(postings, data[i].ords, data[i].tfs, static_cast<long>(N));  // Elias-Fano
+        put_early_bits(early_bits, data[i].early);
     }
     std::ofstream(out_dir + "/terms.txt", std::ios::binary).write(terms_blob.data(), terms_blob.size());
     std::ofstream(out_dir + "/postings.bin", std::ios::binary).write(postings.data(), postings.size());
+    std::ofstream(out_dir + "/early.bin", std::ios::binary).write(early_bits.data(), early_bits.size());
 
     // forward.bin is intentionally NOT written here (nor in the serial path):
     // it is a redundant transpose of postings.bin and is reconstructed in RAM
