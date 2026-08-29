@@ -8,14 +8,18 @@
 // NativeIndex / load_v2 read it unchanged.
 //
 // Purpose is OOM-safety on large corpora: peak memory is one block plus the
-// streaming merge, never the whole postings set. Tokenisation stays in Python
-// (memoised nltk Snowball) — the caller passes each doc's tokens.
+// streaming merge, never the whole postings set. Tokenisation is fused in via
+// the shared Tokenizer (tokenizer.h): add_document_from_text(doc_id, text)
+// tokenises+stems the document entirely in C++, so the token list never crosses
+// into Python during the build. add_document(doc_id, tokens, len) is kept for
+// the pure-Python fallback and tests.
 //
 // Optional + drop-in: retrieve.build_index() uses this if built and falls
 // back to InvertedIndex().build()+save_v2() otherwise.
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include "tokenizer.h"
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -251,6 +255,11 @@ struct SpimiBuilder {
     std::unordered_map<std::string, uint32_t> vocab;
     std::ofstream fwd_tmp;
 
+    // Fused tokenizer (owns the stopword set + stem cache for this worker) and a
+    // reusable token buffer, so add_document_from_text allocates no Python list.
+    Tokenizer tok;
+    std::vector<std::string> tok_buf;
+
     SpimiBuilder(const std::string &d, size_t threshold, uint32_t start_ord = 0)
         : dir(d), flush_threshold(threshold), n_docs(start_ord), docs_out(d + "/docs.txt"),
           doclen_out(d + "/doclen.bin", std::ios::binary),
@@ -307,6 +316,19 @@ struct SpimiBuilder {
         fwd_tmp.write(rec.data(), rec.size());
 
         if (cur_postings >= flush_threshold) flush_block();
+    }
+
+    // Configure the fused tokenizer's stopword filter (already-stemmed stems).
+    void set_stopword_stems(const std::vector<std::string> &stems) {
+        tok.set_stopword_stems(stems);
+    }
+
+    // Fused build entry point: tokenise+stem `text` in C++ and index it, without
+    // ever building a Python token list. Byte-identical to
+    // add_document(doc_id, tokenize_doc(text)...).
+    void add_document_from_text(const std::string &doc_id, const std::string &text) {
+        int doc_len = tok.tokenize(text, tok_buf);
+        add_document(doc_id, tok_buf, doc_len);
     }
 
     void flush_block() {
@@ -725,6 +747,10 @@ PYBIND11_MODULE(_spimi_cpp, m) {
     py::class_<SpimiBuilder>(m, "SpimiBuilder")
         .def(py::init<const std::string &, size_t, uint32_t>(),
              py::arg("index_dir"), py::arg("flush_threshold"), py::arg("start_ord") = 0)
+        .def("set_stopword_stems", &SpimiBuilder::set_stopword_stems,
+             py::arg("stems"))
+        .def("add_document_from_text", &SpimiBuilder::add_document_from_text,
+             py::arg("doc_id"), py::arg("text"))
         .def("add_document", &SpimiBuilder::add_document,
              py::arg("doc_id"), py::arg("tokens"), py::arg("doc_len"))
         .def("case_terms", &SpimiBuilder::case_terms)

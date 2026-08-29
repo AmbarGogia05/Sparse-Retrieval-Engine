@@ -65,10 +65,16 @@ def _spimi_worker(args):
     text cross the IPC boundary."""
     corpus_path, start_byte, n_docs_to_read, start_ord, worker_dir, flush_threshold = args
     from submission._spimi_cpp import SpimiBuilder
-    from submission.indexer import tokenize_doc
+    from submission import indexer
 
     os.makedirs(worker_dir, exist_ok=True)
     builder = SpimiBuilder(worker_dir, flush_threshold, start_ord)
+    # Fused path: the builder tokenises+stems each doc in C++ (no Python token
+    # list). Needs its own stopword set. Falls back to the Python tokenizer when
+    # the C++ tokenizer isn't active (SRE_SNOWBALL / experimental knobs).
+    use_cpp = indexer._USE_CPP_TOKENIZE
+    if use_cpp:
+        builder.set_stopword_stems(list(indexer._STEMMED_STOPWORDS))
     with open(corpus_path, "rb") as f:
         f.seek(start_byte)
         count = 0
@@ -80,8 +86,11 @@ def _spimi_worker(args):
             if not line:
                 continue
             obj = json.loads(line)
-            tokens, doc_len = tokenize_doc(obj["text"])
-            builder.add_document(obj["doc_id"], tokens, doc_len)
+            if use_cpp:
+                builder.add_document_from_text(obj["doc_id"], obj["text"])
+            else:
+                tokens, doc_len = indexer.tokenize_doc(obj["text"])
+                builder.add_document(obj["doc_id"], tokens, doc_len)
             count += 1
     builder.close_worker()
 
@@ -175,13 +184,19 @@ def build_index(corpus_path: str, index_dir: str) -> None:
     # Tokenisation stays in Python (memoised nltk).
     try:
         from submission._spimi_cpp import SpimiBuilder
-        from submission.indexer import tokenize_doc, _stem
+        from submission import indexer
 
         builder = SpimiBuilder(index_dir, _SPIMI_FLUSH_POSTINGS)
+        use_cpp = indexer._USE_CPP_TOKENIZE
+        if use_cpp:
+            builder.set_stopword_stems(list(indexer._STEMMED_STOPWORDS))
         for doc_id, text in corpus:
-            tokens, doc_len = tokenize_doc(text)
-            builder.add_document(doc_id, tokens, doc_len)
-        canonical = {t: _stem(t.lower()) for t in builder.case_terms()}
+            if use_cpp:
+                builder.add_document_from_text(doc_id, text)
+            else:
+                tokens, doc_len = indexer.tokenize_doc(text)
+                builder.add_document(doc_id, tokens, doc_len)
+        canonical = {t: indexer._stem(t.lower()) for t in builder.case_terms()}
         builder.finalize(canonical, _CASE_DF_RATIO)
     except ImportError:
         index = InvertedIndex()
