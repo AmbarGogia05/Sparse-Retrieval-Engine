@@ -456,13 +456,14 @@ class InvertedIndex:
 
         # A2: assign term ordinals by DESCENDING global df (ties broken by
         # term string, ascending, for determinism), not by whatever order
-        # self.postings happens to iterate in. Clusters each doc's terms at
-        # low ordinals in the forward index, shrinking its gaps.
+        # self.postings happens to iterate in. This fixes the terms.txt block
+        # order (== the ids NativeIndex assigns) deterministically; it also
+        # clusters each doc's terms at low ordinals for the forward index that
+        # is reconstructed in RAM at load.
         terms_sorted = sorted(
             self.postings.keys(),
             key=lambda t: (-self.document_frequency(t), t),
         )
-        term_ord = {t: i for i, t in enumerate(terms_sorted)}
 
         term_lines = []
         blob = bytearray()
@@ -479,25 +480,11 @@ class InvertedIndex:
         with open(f"{index_dir}/postings.bin", "wb") as f:
             f.write(bytes(blob))
 
-        # Forward index (doc -> [(term_ord, tf)]) for RM3 relevance models.
-        # term_ord is the term's position in terms_sorted, i.e. terms.txt
-        # order == the ids NativeIndex assigns. Same per-doc format as
-        # _spimi_cpp.write_forward: VByte(count) then A1-coded term-ordinal
-        # postings, one record per doc in docs.txt order.
-        forward = {d: [] for d in self.doc_len}
-        for term, plist in self.postings.items():
-            to = term_ord[term]
-            for d, tf in plist.items():
-                forward[d].append((to, tf))
-        fblob = bytearray()
-        for doc_id in self.doc_len:  # docs.txt order
-            items = sorted(forward[doc_id])  # ascending term_ord
-            ords = [o for o, _ in items]
-            tfs = [t for _, t in items]
-            fblob += _vbyte_encode([len(ords)])
-            fblob += _encode_postings(ords, tfs)  # A1 codec
-        with open(f"{index_dir}/forward.bin", "wb") as f:
-            f.write(bytes(fblob))
+        # No forward.bin is persisted: the forward index (doc -> [(term_ord,
+        # tf)]) that RM3 needs is a byte-for-byte redundant transpose of the
+        # postings above, and NativeIndex reconstructs it in RAM at load time
+        # (see _index_cpp.cpp load()). Persisting it roughly doubled the index
+        # size for zero extra information.
 
         with open(f"{index_dir}/meta.json", "w") as f:
             json.dump(

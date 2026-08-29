@@ -12,7 +12,7 @@ Methodology (mirrors tune_bm25.py, and the same overfitting discipline):
 
   2. Fixed: R = 10 feedback docs (per design), k1/b = 1.8/0.6 (shipped BM25),
      and the fusion (RM3-BM25 fused with VSM on the *original* query, weighted RRF
-     W_BM=0.6, exactly the shipped fusion with BM25 swapped for RM3-BM25).
+     W_BM=0.7, exactly the shipped fusion with BM25 swapped for RM3-BM25).
 
   3. Swept: M (number of expansion terms) x lambda (anchor weight on the
      original query; lambda=1.0 recovers plain BM25, i.e. no expansion).
@@ -50,7 +50,10 @@ BM25_K1 = 1.8
 BM25_B = 0.6
 CAND = 1000
 RRF_K = 60
-W_BM = 0.6
+W_BM = 0.7
+# Shipped RM3 feedback-weighting settings (see custom_scorer).
+FB_TEMP = 0.15
+NOVEL = True
 
 # Swept grids.
 M_GRID = [5, 10, 15, 20, 30]
@@ -154,7 +157,8 @@ def main():
         for lam in LAMBDA_GRID:
             total = 0.0
             for q in qids:
-                bm = idx.rm3(q_tokens[q], R_FEEDBACK, m, lam, BM25_K1, BM25_B, CAND)
+                bm = idx.rm3(q_tokens[q], R_FEEDBACK, m, lam, BM25_K1, BM25_B, CAND,
+                         FB_TEMP, NOVEL)
                 total += ndcg_at_k([d for d, _ in fuse(bm, vs_cache[q])], qrels[q], k=10)
             grid[(m, lam)] = total / len(qids)
 

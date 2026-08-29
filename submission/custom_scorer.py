@@ -30,6 +30,17 @@ RM3_R = int(os.environ.get("SRE_RM3_R", 10))
 RM3_M = int(os.environ.get("SRE_RM3_M", 15))
 RM3_LAMBDA = float(os.environ.get("SRE_RM3_LAMBDA", 0.6))
 
+# Feedback-document weights are a softmax of the round-1 BM25 score over the
+# top-R docs (normalised by the top score, so the weighting is scale-free
+# across corpora) rather than score/sum, which lets one anomalous top document
+# dominate the relevance model. RM3_NOVEL keeps the M expansion slots for terms
+# the query doesn't already contain. The two are superadditive: +0.002 each,
+# +0.009 together, pooled over 1221 queries on four corpora. The temperature is
+# the interior of the [0.10, 0.20] band that is non-negative on every corpus,
+# not any single corpus's argmax. See runs/rm3_feedback_weighting.md
+RM3_FB_TEMP = float(os.environ.get("SRE_RM3_FB_TEMP", 0.15))
+RM3_NOVEL = os.environ.get("SRE_RM3_NOVEL", "1") != "0"
+
 # At RRF_K=60 a doc at rank 1000 contributes 1/1060, far below anything that
 # reaches the top 10 — so fusing top-1000 per arm costs no measurable nDCG@10.
 _CAND = 1000
@@ -66,7 +77,8 @@ def score(query: str, k: int) -> List[Tuple[str, float]]:
         # disagreement, so expanding both arms would erode the gain.
         if USE_RM3 and getattr(_NATIVE, "has_forward", False):
             bm_hits = _NATIVE.rm3(tokens, RM3_R, RM3_M, RM3_LAMBDA,
-                                  BM25_K1, BM25_B, _CAND)
+                                  BM25_K1, BM25_B, _CAND,
+                                  RM3_FB_TEMP, RM3_NOVEL)
         else:
             bm_hits = _NATIVE.bm25(tokens, BM25_K1, BM25_B, _CAND)
         vs_hits = _NATIVE.vsm(tokens, _CAND)

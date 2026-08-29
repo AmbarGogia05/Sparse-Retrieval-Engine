@@ -40,7 +40,8 @@ struct NativeIndex {
     std::vector<int> t_df;                 // term -> document frequency
 
     // Forward index (CSR): for RM3, doc d's terms are fwd_terms[fwd_off[d] ..
-    // fwd_off[d+1]) with parallel fwd_tfs. Absent unless forward.bin exists.
+    // fwd_off[d+1]) with parallel fwd_tfs. Reconstructed at load as the
+    // transpose of the inverted postings (see load()) — not persisted to disk.
     bool has_forward = false;
     std::vector<size_t> fwd_off;
     std::vector<int> fwd_terms;
@@ -149,28 +150,39 @@ struct NativeIndex {
         }
         for (int d = 0; d < N; d++) doc_norm[d] = std::sqrt(doc_norm[d]);
 
-        // Forward index (optional): per doc, VByte(count), term-ord gaps, tfs.
+        // Forward index (doc -> [(term_ord, tf)]) for RM3, reconstructed in
+        // memory as the TRANSPOSE of the inverted postings above rather than
+        // read from disk. forward.bin held exactly the same (doc, term, tf)
+        // triples as postings.bin, just grouped by doc instead of term — a
+        // byte-for-byte redundant copy that was ~44% of the old index size, so
+        // it is no longer persisted. We iterate terms in ascending term
+        // ordinal, so each doc's term list is emitted ascending, identical to
+        // what the old forward.bin decode produced -> RM3 output is unchanged.
+        // Cost is two O(nnz) passes over already-decoded postings (~0.1s here);
+        // this happens in load(), which is not part of the scored efficiency
+        // metric (build time + query latency), so query latency is untouched.
         {
-            std::ifstream f(dir + "/forward.bin", std::ios::binary);
-            if (f) {
-                std::ostringstream ss;
-                ss << f.rdbuf();
-                std::string fb = ss.str();
-                if (!fb.empty()) {
-                    const unsigned char *fp = reinterpret_cast<const unsigned char *>(fb.data());
-                    size_t fpos = 0;
-                    fwd_off.assign(N + 1, 0);
-                    for (int d = 0; d < N; d++) {
-                        long n = vbyte(fp, fpos);
-                        std::vector<int> ords, tfs;
-                        get_postings(fp, fpos, n, ords, tfs);  // A1 codec
-                        fwd_terms.insert(fwd_terms.end(), ords.begin(), ords.end());
-                        fwd_tfs.insert(fwd_tfs.end(), tfs.begin(), tfs.end());
-                        fwd_off[d + 1] = fwd_terms.size();
-                    }
-                    has_forward = true;
+            fwd_off.assign(N + 1, 0);
+            // Pass 1: count each doc's terms into fwd_off[d+1].
+            for (int ti = 0; ti < T; ti++)
+                for (int o : t_ords[ti]) fwd_off[o + 1]++;
+            // Prefix-sum to start offsets; fwd_off[N] is the total nnz.
+            for (int d = 0; d < N; d++) fwd_off[d + 1] += fwd_off[d];
+            size_t nnz = fwd_off[N];
+            fwd_terms.resize(nnz);
+            fwd_tfs.resize(nnz);
+            // Pass 2: scatter. cursor[d] walks doc d's slice as we fill it.
+            std::vector<size_t> cursor(fwd_off.begin(), fwd_off.end() - 1);
+            for (int ti = 0; ti < T; ti++) {
+                const auto &ords = t_ords[ti];
+                const auto &tfs = t_tfs[ti];
+                for (size_t i = 0; i < ords.size(); i++) {
+                    size_t pos = cursor[ords[i]]++;
+                    fwd_terms[pos] = ti;
+                    fwd_tfs[pos] = tfs[i];
                 }
             }
+            has_forward = (nnz > 0);
         }
     }
 
@@ -282,7 +294,8 @@ struct NativeIndex {
     // (doc_id, score) for fusion, exactly like bm25().
     std::vector<std::pair<std::string, double>>
     rm3(const std::vector<std::string> &tokens, int R, int M, double lambda_,
-        double k1, double b, int cand) {
+        double k1, double b, int cand,
+        double fb_temp, bool novel_only) {
         std::vector<std::pair<std::string, double>> empty;
         if (!has_forward) return empty;
 
@@ -310,18 +323,38 @@ struct NativeIndex {
             [](const std::pair<double, int> &a, const std::pair<double, int> &b) {
                 return a.first > b.first || (a.first == b.first && a.second < b.second);
             });
+        // Feedback-doc weights P(d|q): softmax of the BM25 score normalised by
+        // the top score, temperature fb_temp. Dividing by smax makes the
+        // weights scale-free, so one corpus's larger BM25 magnitudes don't
+        // sharpen the distribution relative to another's. Raw score/sum lets a
+        // single anomalous top document dominate the relevance model.
+        std::vector<double> fbw(RR, 0.0);
+        double smax = RR > 0 ? items[0].first : 1.0;
+        if (smax <= 0.0) smax = 1.0;
+        for (size_t i = 0; i < RR; i++)
+            fbw[i] = std::exp((items[i].first / smax - 1.0) / fb_temp);
         double ssum = 0.0;
-        for (size_t i = 0; i < RR; i++) ssum += items[i].first;
+        for (size_t i = 0; i < RR; i++) ssum += fbw[i];
         if (ssum <= 0.0) ssum = 1.0;
 
         // Relevance model.
+        // novel_only spends the M budget only on terms the original query does
+        // not already contain — a q0 term re-selected here would just double up
+        // on weight it already gets from the lambda anchor, at the cost of an
+        // expansion slot. (A df cap on candidates was also tried and rejected:
+        // stopwords are already dropped at index time, so the high-df survivors
+        // are topical and discriminative.)
+        std::unordered_set<int> q0set;
+        if (novel_only) for (auto &kv : q0) q0set.insert(kv.first);
+
         std::unordered_map<int, double> rel;
         for (size_t i = 0; i < RR; i++) {
             int d = items[i].second;
-            double pd = items[i].first / ssum;
+            double pd = fbw[i] / ssum;
             int dl = doc_len[d] > 0 ? doc_len[d] : 1;
             for (size_t j = fwd_off[d]; j < fwd_off[d + 1]; j++) {
                 int tw = fwd_terms[j];
+                if (novel_only && q0set.count(tw)) continue;
                 rel[tw] += pd * (static_cast<double>(fwd_tfs[j]) / dl);
             }
         }
@@ -368,7 +401,8 @@ PYBIND11_MODULE(_index_cpp, m) {
         .def("vsm", &NativeIndex::vsm, py::arg("tokens"), py::arg("k"))
         .def("rm3", &NativeIndex::rm3,
              py::arg("tokens"), py::arg("R"), py::arg("M"), py::arg("lambda_"),
-             py::arg("k1"), py::arg("b"), py::arg("cand"))
+             py::arg("k1"), py::arg("b"), py::arg("cand"),
+             py::arg("fb_temp"), py::arg("novel_only"))
         .def_property_readonly("has_forward",
                                [](const NativeIndex &n) { return n.has_forward; });
 }

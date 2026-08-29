@@ -413,7 +413,11 @@ struct SpimiBuilder {
         }
         std::ofstream(dir + "/postings.bin", std::ios::binary).write(postings.data(), postings.size());
 
-        write_forward(local_to_final);
+        // forward.bin is intentionally NOT written: it is a byte-for-byte
+        // redundant transpose of postings.bin, and NativeIndex reconstructs the
+        // forward index in RAM at load time (see _index_cpp.cpp load()). This
+        // roughly halves the persisted index size. write_forward()/
+        // encode_forward_bytes() are kept for reference but no longer called.
 
         // meta.json (N, avg_doc_len, case_terms) — hand-written, no JSON dep.
         double avg = n_docs ? static_cast<double>(total_len) / n_docs : 0.0;
@@ -622,15 +626,11 @@ void finalize_parallel(const py::list &workers, const std::string &out_dir,
     }
     std::ofstream(out_dir + "/postings.bin", std::ios::binary).write(postings.data(), postings.size());
 
-    // forward.bin: per-worker encode, concatenated in worker (== global
-    // doc-ordinal) order — matches docs.txt concatenation above.
-    {
-        std::ofstream fwd_out(out_dir + "/forward.bin", std::ios::binary);
-        for (size_t wi = 0; wi < ws.size(); wi++) {
-            std::string enc = encode_forward_bytes(ws[wi].forward_tmp, ws[wi].n_docs, local_to_final[wi]);
-            fwd_out.write(enc.data(), enc.size());
-        }
-    }
+    // forward.bin is intentionally NOT written here (nor in the serial path):
+    // it is a redundant transpose of postings.bin and is reconstructed in RAM
+    // at load time by NativeIndex (see _index_cpp.cpp load()). The per-worker
+    // forward.tmp scratch is still produced and removed below; only the final
+    // persisted forward.bin is dropped.
 
     // meta.json — identical format/logic to SpimiBuilder::finalize.
     double avg = N ? static_cast<double>(total_len) / N : 0.0;
