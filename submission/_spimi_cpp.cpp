@@ -57,6 +57,49 @@ static void put_vbyte(std::string &out, long n) {
     }
 }
 
+static bool pack_docid(const std::string &id, uint64_t &value) {
+    if (id.size() != 8) return false;
+    value = 0;
+    for (char c : id) {
+        int digit = -1;
+        if (c >= '0' && c <= '9') digit = c - '0';
+        else if (c >= 'a' && c <= 'z') digit = c - 'a' + 10;
+        else return false;
+        value = value * 36u + static_cast<uint64_t>(digit);
+    }
+    return true;
+}
+
+static void compact_docids(const std::string &dir) {
+    std::ifstream in(dir + "/docs.txt");
+    std::vector<uint64_t> values;
+    std::string id;
+    bool packable = true;
+    while (std::getline(in, id)) {
+        uint64_t value = 0;
+        if (!pack_docid(id, value)) {
+            packable = false;
+            break;
+        }
+        values.push_back(value);
+    }
+    if (!packable) {
+        std::remove((dir + "/docids.bin").c_str());
+        return;
+    }
+    std::ofstream out(dir + "/docids.bin", std::ios::binary);
+    out.write("D36", 3);
+    out.put(static_cast<char>(1));
+    for (uint64_t value : values) {
+        for (int i = 0; i < 6; i++) {
+            out.put(static_cast<char>(value & 0xFFu));
+            value >>= 8;
+        }
+    }
+    out.close();
+    std::remove((dir + "/docs.txt").c_str());
+}
+
 // Append one front-coded term record to `out` (terms.txt is front-coded and
 // alphabetical): VByte(shared prefix len with prev) VByte(suffix len) suffix
 // VByte(df); updates prev. Mirrors indexer._encode_terms and the terms reader
@@ -70,6 +113,25 @@ static void put_term_frontcoded(std::string &out, std::string &prev,
     out.append(term, s, term.size() - s);
     put_vbyte(out, df);
     prev = term;
+}
+
+// Compact case-sensitive vocabulary sidecar. The CT1 stream is front-coded
+// alphabetically and has no per-term df because it is only a membership set.
+static void put_case_terms(std::string &out,
+                           const std::unordered_set<std::string> &case_terms) {
+    std::vector<std::string> sorted(case_terms.begin(), case_terms.end());
+    std::sort(sorted.begin(), sorted.end());
+    out.append("CT1", 3);
+    std::string prev;
+    for (const auto &term : sorted) {
+        size_t shared = 0;
+        size_t mm = std::min(prev.size(), term.size());
+        while (shared < mm && prev[shared] == term[shared]) shared++;
+        put_vbyte(out, static_cast<long>(shared));
+        put_vbyte(out, static_cast<long>(term.size() - shared));
+        out.append(term, shared, term.size() - shared);
+        prev = term;
+    }
 }
 
 // Read one VByte from a byte buffer, advancing pos (mirror of put_vbyte).
@@ -120,7 +182,8 @@ static void put_postings(std::string &out, const std::vector<uint32_t> &ords,
 // Must stay byte-identical to indexer._encode_postings and _index_cpp
 // NativeIndex::get_postings (which recomputes l from m,N and decodes this).
 static void put_postings_ef(std::string &out, const std::vector<uint32_t> &ords,
-                            const std::vector<uint32_t> &tfs, long N) {
+                            const std::vector<uint32_t> &tfs, long N,
+                            bool all_tf_one = false) {
     long m = static_cast<long>(ords.size());
     int l = 0;
     if (m > 0) { long q = N / m; if (q >= 1) { while ((q >> 1) != 0) { q >>= 1; l++; } } }
@@ -147,6 +210,7 @@ static void put_postings_ef(std::string &out, const std::vector<uint32_t> &ords,
         }
         if (nb) out.push_back(static_cast<char>(buf & 0xFF));
     }
+    if (all_tf_one) return;
     // tf-1 in blocks of 128.
     long done = 0;
     while (done < m) {
@@ -168,22 +232,89 @@ static void put_postings_ef(std::string &out, const std::vector<uint32_t> &ords,
     }
 }
 
-// Pack one prefix-presence bit per ordinary posting, LSB-first and byte-padded
-// independently for each term. The matching posting-list df tells the decoder
-// exactly how many bits to consume; no per-list header is needed.
-static void put_early_bits(std::string &out, const std::vector<uint8_t> &early) {
-    unsigned char byte = 0;
-    int bit = 0;
-    for (uint8_t flag : early) {
-        if (flag) byte |= static_cast<unsigned char>(1u << bit);
-        bit++;
-        if (bit == 8) {
-            out.push_back(static_cast<char>(byte));
-            byte = 0;
-            bit = 0;
+// Elias-Fano encode a strictly increasing sequence in [0, universe), without
+// term frequencies. Used by early.bin for the sparse posting positions whose
+// early flag is set.
+static void put_monotone_ef(std::string &out, const std::vector<uint32_t> &vals,
+                            long universe) {
+    long m = static_cast<long>(vals.size());
+    int l = 0;
+    if (m > 0) {
+        long q = universe / m;
+        if (q >= 1) {
+            while ((q >> 1) != 0) { q >>= 1; l++; }
         }
     }
-    if (bit != 0) out.push_back(static_cast<char>(byte));
+    {
+        uint64_t buf = 0;
+        int nb = 0;
+        uint32_t mask = (l > 0) ? ((1u << l) - 1u) : 0u;
+        for (long i = 0; i < m; i++) {
+            buf |= static_cast<uint64_t>(vals[i] & mask) << nb;
+            nb += l;
+            while (nb >= 8) {
+                out.push_back(static_cast<char>(buf & 0xFF));
+                buf >>= 8;
+                nb -= 8;
+            }
+        }
+        if (nb) out.push_back(static_cast<char>(buf & 0xFF));
+    }
+    {
+        uint64_t buf = 0;
+        int nb = 0;
+        uint32_t prev = 0;
+        for (long i = 0; i < m; i++) {
+            uint32_t hi = vals[i] >> l;
+            nb += static_cast<int>(hi - prev);
+            while (nb >= 8) {
+                out.push_back(static_cast<char>(buf & 0xFF));
+                buf >>= 8;
+                nb -= 8;
+            }
+            buf |= static_cast<uint64_t>(1) << nb;
+            nb++;
+            while (nb >= 8) {
+                out.push_back(static_cast<char>(buf & 0xFF));
+                buf >>= 8;
+                nb -= 8;
+            }
+            prev = hi;
+        }
+        if (nb) out.push_back(static_cast<char>(buf & 0xFF));
+    }
+}
+
+// Sparse early-posting stream:
+//   "SEF1"
+//   ceil(num_terms/8) presence bits (term has at least one early posting)
+//   for each present term: VByte(early_df), EF(posting positions, universe=df)
+//
+// Encoding positions within the ordinary posting list avoids repeating doc
+// ordinals. Only ~12% of postings are early on the full corpus, so this is
+// materially smaller than one bit per posting and lets the reader retain only
+// the matching doc ordinals in memory.
+template <typename PerTerm>
+static std::string encode_early_sparse(const std::vector<PerTerm> &data) {
+    std::string out("SEF1", 4);
+    size_t bitmap_pos = out.size();
+    out.resize(bitmap_pos + (data.size() + 7) / 8, '\0');
+    for (size_t ti = 0; ti < data.size(); ti++) {
+        const auto &flags = data[ti].early;
+        size_t m = 0;
+        for (uint8_t flag : flags) m += flag != 0;
+        if (m == 0) continue;
+        out[bitmap_pos + ti / 8] = static_cast<char>(
+            static_cast<unsigned char>(out[bitmap_pos + ti / 8]) |
+            static_cast<unsigned char>(1u << (ti % 8)));
+        put_vbyte(out, static_cast<long>(m));
+        std::vector<uint32_t> positions;
+        positions.reserve(m);
+        for (size_t i = 0; i < flags.size(); i++)
+            if (flags[i]) positions.push_back(static_cast<uint32_t>(i));
+        put_monotone_ef(out, positions, static_cast<long>(flags.size()));
+    }
+    return out;
 }
 
 // Decode one worker's forward.tmp (local-id gaps + tfs per doc, written by
@@ -567,17 +698,28 @@ struct SpimiBuilder {
 
         std::string terms_blob;   // front-coded, buffered, written once
         std::string postings;      // buffered, written once
-        std::string early_bits;    // one packed bit per ordinary posting
+        std::string tf_one("TF1", 3);
+        tf_one.resize(3 + (kept_terms.size() + 7) / 8, '\0');
         std::string prev_term;
         for (size_t i = 0; i < kept_terms.size(); i++) {
             put_term_frontcoded(terms_blob, prev_term, kept_terms[i],
                                 static_cast<long>(data[i].ords.size()));
-            put_postings_ef(postings, data[i].ords, data[i].tfs, static_cast<long>(n_docs));  // Elias-Fano
-            put_early_bits(early_bits, data[i].early);
+            bool all_one = std::all_of(data[i].tfs.begin(), data[i].tfs.end(),
+                                       [](uint32_t tf) { return tf == 1; });
+            if (all_one)
+                tf_one[3 + i / 8] = static_cast<char>(
+                    static_cast<unsigned char>(tf_one[3 + i / 8]) |
+                    static_cast<unsigned char>(1u << (i % 8)));
+            put_postings_ef(postings, data[i].ords, data[i].tfs,
+                            static_cast<long>(n_docs), all_one);
         }
+        std::string early_sparse = encode_early_sparse(data);
         std::ofstream(dir + "/terms.txt", std::ios::binary).write(terms_blob.data(), terms_blob.size());
         std::ofstream(dir + "/postings.bin", std::ios::binary).write(postings.data(), postings.size());
-        std::ofstream(dir + "/early.bin", std::ios::binary).write(early_bits.data(), early_bits.size());
+        std::ofstream(dir + "/tf1.bin", std::ios::binary)
+            .write(tf_one.data(), tf_one.size());
+        std::ofstream(dir + "/early.bin", std::ios::binary)
+            .write(early_sparse.data(), early_sparse.size());
 
         // forward.bin is intentionally NOT written: it is a byte-for-byte
         // redundant transpose of postings.bin, and NativeIndex reconstructs the
@@ -585,19 +727,18 @@ struct SpimiBuilder {
         // roughly halves the persisted index size. write_forward()/
         // encode_forward_bytes() are kept for reference but no longer called.
 
-        // meta.json (N, avg_doc_len, case_terms) — hand-written, no JSON dep.
+        std::string case_blob;
+        put_case_terms(case_blob, keep_case);
+        std::ofstream(dir + "/case_terms.bin", std::ios::binary)
+            .write(case_blob.data(), case_blob.size());
+
+        // meta.json (N, avg_doc_len) — case terms are front-coded separately.
         double avg = n_docs ? static_cast<double>(total_len) / n_docs : 0.0;
         std::ofstream meta(dir + "/meta.json");
         meta << std::setprecision(std::numeric_limits<double>::max_digits10);
-        meta << "{\"N\": " << n_docs << ", \"avg_doc_len\": " << avg << ", \"case_terms\": [";
-        bool f2 = true;
-        for (auto &t : keep_case) {
-            if (!f2) meta << ", ";
-            f2 = false;
-            meta << '"' << t << '"';
-        }
-        meta << "]}";
+        meta << "{\"N\": " << n_docs << ", \"avg_doc_len\": " << avg << "}";
         meta.close();
+        compact_docids(dir);
 
         for (auto &path : block_files) std::remove(path.c_str());
         std::remove((dir + "/forward.tmp").c_str());
@@ -789,17 +930,28 @@ void finalize_parallel(const py::list &workers, const std::string &out_dir,
 
     std::string terms_blob;   // front-coded, buffered, written once
     std::string postings;
-    std::string early_bits;
+    std::string tf_one("TF1", 3);
+    tf_one.resize(3 + (kept_terms.size() + 7) / 8, '\0');
     std::string prev_term;
     for (size_t i = 0; i < kept_terms.size(); i++) {
         put_term_frontcoded(terms_blob, prev_term, kept_terms[i],
                             static_cast<long>(data[i].ords.size()));
-        put_postings_ef(postings, data[i].ords, data[i].tfs, static_cast<long>(N));  // Elias-Fano
-        put_early_bits(early_bits, data[i].early);
+        bool all_one = std::all_of(data[i].tfs.begin(), data[i].tfs.end(),
+                                   [](uint32_t tf) { return tf == 1; });
+        if (all_one)
+            tf_one[3 + i / 8] = static_cast<char>(
+                static_cast<unsigned char>(tf_one[3 + i / 8]) |
+                static_cast<unsigned char>(1u << (i % 8)));
+        put_postings_ef(postings, data[i].ords, data[i].tfs,
+                        static_cast<long>(N), all_one);
     }
+    std::string early_sparse = encode_early_sparse(data);
     std::ofstream(out_dir + "/terms.txt", std::ios::binary).write(terms_blob.data(), terms_blob.size());
     std::ofstream(out_dir + "/postings.bin", std::ios::binary).write(postings.data(), postings.size());
-    std::ofstream(out_dir + "/early.bin", std::ios::binary).write(early_bits.data(), early_bits.size());
+    std::ofstream(out_dir + "/tf1.bin", std::ios::binary)
+        .write(tf_one.data(), tf_one.size());
+    std::ofstream(out_dir + "/early.bin", std::ios::binary)
+        .write(early_sparse.data(), early_sparse.size());
 
     // forward.bin is intentionally NOT written here (nor in the serial path):
     // it is a redundant transpose of postings.bin and is reconstructed in RAM
@@ -807,19 +959,18 @@ void finalize_parallel(const py::list &workers, const std::string &out_dir,
     // forward.tmp scratch is still produced and removed below; only the final
     // persisted forward.bin is dropped.
 
+    std::string case_blob;
+    put_case_terms(case_blob, keep_case);
+    std::ofstream(out_dir + "/case_terms.bin", std::ios::binary)
+        .write(case_blob.data(), case_blob.size());
+
     // meta.json — identical format/logic to SpimiBuilder::finalize.
     double avg = N ? static_cast<double>(total_len) / N : 0.0;
     std::ofstream meta(out_dir + "/meta.json");
     meta << std::setprecision(std::numeric_limits<double>::max_digits10);
-    meta << "{\"N\": " << N << ", \"avg_doc_len\": " << avg << ", \"case_terms\": [";
-    bool f2 = true;
-    for (auto &t : keep_case) {
-        if (!f2) meta << ", ";
-        f2 = false;
-        meta << '"' << t << '"';
-    }
-    meta << "]}";
+    meta << "{\"N\": " << N << ", \"avg_doc_len\": " << avg << "}";
     meta.close();
+    compact_docids(out_dir);
 
     for (auto &path : all_blocks) std::remove(path.c_str());
     for (auto &w : ws) {

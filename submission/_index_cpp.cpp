@@ -40,7 +40,7 @@ struct NativeIndex {
     std::unordered_map<std::string, int> term_id;
     std::vector<std::vector<int>> t_ords;  // term -> sorted doc ordinals
     std::vector<std::vector<int>> t_tfs;   // term -> term frequencies
-    std::vector<std::vector<uint8_t>> t_early; // term -> prefix-presence flags
+    std::vector<std::vector<int>> t_early_ords; // term -> docs with prefix presence
     std::vector<int> t_df;                 // term -> document frequency
 
     // Forward index (CSR): for RM3, doc d's terms are fwd_terms[fwd_off[d] ..
@@ -79,7 +79,8 @@ struct NativeIndex {
     // (Elias-Fano of the monotone doc-ids, then (tf-1) in 128-blocks). See the
     // codec comment in indexer.py; l is recomputed from (df, N), not stored.
     static void get_postings(const unsigned char *p, size_t &pos, long df, long N,
-                             std::vector<int> &ords, std::vector<int> &tfs) {
+                             std::vector<int> &ords, std::vector<int> &tfs,
+                             bool all_tf_one = false) {
         long m = df;
         ords.resize(m);
         tfs.resize(m);
@@ -120,6 +121,10 @@ struct NativeIndex {
             }
             pos = bi;  // writer byte-padded the high stream
         }
+        if (all_tf_one) {
+            tfs.assign(m, 1);
+            return;
+        }
         // tf blocks: (tf-1) in blocks of 128, per block a width byte then packed.
         long done = 0;
         while (done < m) {
@@ -142,13 +147,85 @@ struct NativeIndex {
         }
     }
 
+    // Decode the no-TF Elias-Fano stream used by sparse early.bin records.
+    static void get_monotone_ef(const unsigned char *p, size_t &pos, long m,
+                                long universe, std::vector<int> &vals) {
+        vals.resize(m);
+        int l = ef_l(m, universe);
+        std::vector<int> lows(m, 0);
+        if (l > 0) {
+            uint64_t buf = 0;
+            int nb = 0;
+            size_t bi = pos;
+            long mask = (1L << l) - 1;
+            for (long i = 0; i < m; i++) {
+                while (nb < l) {
+                    buf |= static_cast<uint64_t>(p[bi++]) << nb;
+                    nb += 8;
+                }
+                lows[i] = static_cast<int>(buf & mask);
+                buf >>= l;
+                nb -= l;
+            }
+        }
+        pos += static_cast<size_t>((m * static_cast<long>(l) + 7) / 8);
+        uint64_t buf = 0;
+        int nb = 0;
+        size_t bi = pos;
+        long cur = 0;
+        long ones = 0;
+        while (ones < m) {
+            if (nb == 0) {
+                buf = p[bi++];
+                nb = 8;
+            }
+            int bit = static_cast<int>(buf & 1);
+            buf >>= 1;
+            nb--;
+            if (bit) {
+                vals[ones] = static_cast<int>(
+                    (cur << l) | static_cast<long>(lows[ones]));
+                ones++;
+            } else {
+                cur++;
+            }
+        }
+        pos = bi;
+    }
+
     void load(const std::string &dir) {
         // A4: docs.txt now holds ONLY verbatim doc-id lines; lengths live in
         // the parallel VByte stream doclen.bin, same doc order.
         {
-            std::ifstream f(dir + "/docs.txt");
-            std::string line;
-            while (std::getline(f, line)) docid.push_back(line);
+            std::ifstream packed(dir + "/docids.bin", std::ios::binary);
+            char magic[4] = {};
+            if (packed.read(magic, 4) &&
+                std::string(magic, 4) == std::string("D36\1", 4)) {
+                uint64_t count = 0;
+                packed.seekg(0, std::ios::end);
+                std::streamoff total = packed.tellg();
+                packed.seekg(4, std::ios::beg);
+                count = total >= 4 ? static_cast<uint64_t>((total - 4) / 6) : 0;
+                docid.reserve(static_cast<size_t>(count));
+                for (uint64_t i = 0; i < count; i++) {
+                    uint64_t value = 0;
+                    for (int j = 0; j < 6; j++)
+                        value |= static_cast<uint64_t>(
+                            static_cast<unsigned char>(packed.get())) << (8 * j);
+                    std::string id(8, '0');
+                    for (int j = 7; j >= 0; j--) {
+                        int digit = static_cast<int>(value % 36u);
+                        id[j] = digit < 10 ? static_cast<char>('0' + digit)
+                                           : static_cast<char>('a' + digit - 10);
+                        value /= 36u;
+                    }
+                    docid.push_back(std::move(id));
+                }
+            } else {
+                std::ifstream f(dir + "/docs.txt");
+                std::string line;
+                while (std::getline(f, line)) docid.push_back(line);
+            }
         }
         N = static_cast<int>(docid.size());
         for (int d = 0; d < N; d++) doc_ord[docid[d]] = d;
@@ -204,20 +281,35 @@ struct NativeIndex {
         int T = static_cast<int>(terms.size());
         t_ords.resize(T);
         t_tfs.resize(T);
-        t_early.resize(T);
+        t_early_ords.resize(T);
         t_df.resize(T);
+        std::vector<uint8_t> tf_all_one(T, 0);
+        {
+            std::ifstream f(dir + "/tf1.bin", std::ios::binary);
+            std::string tfb((std::istreambuf_iterator<char>(f)),
+                            std::istreambuf_iterator<char>());
+            size_t bytes = (static_cast<size_t>(T) + 7) / 8;
+            if (tfb.size() >= 3 + bytes && tfb.compare(0, 3, "TF1") == 0) {
+                for (int ti = 0; ti < T; ti++)
+                    tf_all_one[ti] = static_cast<uint8_t>(
+                        (static_cast<unsigned char>(tfb[3 + ti / 8])
+                         >> (ti % 8)) & 1u);
+            }
+        }
         for (int ti = 0; ti < T; ti++) {
             int df = dfs[ti];
             t_df[ti] = df;
             term_id[terms[ti]] = ti;
             auto &ords = t_ords[ti];
             auto &tfs = t_tfs[ti];
-            get_postings(p, pos, df, N, ords, tfs);  // Elias-Fano codec
+            get_postings(p, pos, df, N, ords, tfs,
+                         tf_all_one[ti] != 0);  // Elias-Fano codec
         }
 
-        // Optional packed prefix-presence stream: one bit per ordinary posting,
-        // term by term in the same order as terms.txt/postings.bin. Its absence
-        // is valid for older or pure-Python-built indexes and means all-zero.
+        // Optional prefix-presence stream. New indexes store sparse posting
+        // positions as Elias-Fano records ("SEF1"); old packed-bit indexes are
+        // still accepted. In RAM retain only the matching document ordinals,
+        // so early_match traverses the sparse signal rather than full postings.
         {
             std::ifstream f(dir + "/early.bin", std::ios::binary);
             std::ostringstream ss;
@@ -225,18 +317,39 @@ struct NativeIndex {
             std::string eb = ss.str();
             const unsigned char *ep =
                 reinterpret_cast<const unsigned char *>(eb.data());
-            size_t epos = 0;
-            for (int ti = 0; ti < T; ti++) {
-                size_t df = static_cast<size_t>(t_df[ti]);
-                auto &flags = t_early[ti];
-                flags.assign(df, 0);
-                size_t bytes = (df + 7) / 8;
-                if (epos + bytes <= eb.size()) {
-                    for (size_t i = 0; i < df; i++)
-                        flags[i] = static_cast<uint8_t>(
-                            (ep[epos + i / 8] >> (i % 8)) & 1u);
+            if (eb.size() >= 4 && eb.compare(0, 4, "SEF1") == 0) {
+                size_t bitmap_pos = 4;
+                size_t bitmap_bytes = (static_cast<size_t>(T) + 7) / 8;
+                size_t epos = bitmap_pos + bitmap_bytes;
+                if (epos <= eb.size()) {
+                    for (int ti = 0; ti < T; ti++) {
+                        if (!((ep[bitmap_pos + static_cast<size_t>(ti) / 8]
+                               >> (ti % 8)) & 1u))
+                            continue;
+                        long m = vbyte(ep, epos);
+                        std::vector<int> positions;
+                        get_monotone_ef(ep, epos, m, t_df[ti], positions);
+                        auto &docs = t_early_ords[ti];
+                        docs.reserve(positions.size());
+                        for (int pi : positions)
+                            if (pi >= 0 &&
+                                static_cast<size_t>(pi) < t_ords[ti].size())
+                                docs.push_back(t_ords[ti][pi]);
+                    }
                 }
-                epos += bytes;
+            } else {
+                size_t epos = 0;
+                for (int ti = 0; ti < T; ti++) {
+                    size_t df = static_cast<size_t>(t_df[ti]);
+                    size_t bytes = (df + 7) / 8;
+                    if (epos + bytes <= eb.size()) {
+                        auto &docs = t_early_ords[ti];
+                        for (size_t i = 0; i < df; i++)
+                            if ((ep[epos + i / 8] >> (i % 8)) & 1u)
+                                docs.push_back(t_ords[ti][i]);
+                    }
+                    epos += bytes;
+                }
             }
         }
 
@@ -461,11 +574,7 @@ struct NativeIndex {
         std::vector<double> score(N, 0.0);
         std::vector<int> touched;
         for (int ti : qterms) {
-            auto &ords = t_ords[ti];
-            auto &flags = t_early[ti];
-            for (size_t i = 0; i < ords.size(); i++) {
-                if (i >= flags.size() || !flags[i]) continue;
-                int d = ords[i];
+            for (int d : t_early_ords[ti]) {
                 if (score[d] == 0.0) touched.push_back(d);
                 score[d] += 1.0;
             }

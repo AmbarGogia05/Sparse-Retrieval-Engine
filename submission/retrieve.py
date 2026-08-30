@@ -214,10 +214,11 @@ def load_index(index_dir: str) -> None:
     try:
         import submission._index_cpp  # noqa: F401  (presence check)
         import json
-        from submission.indexer import set_case_terms
+        from submission import indexer
 
         with open(f"{index_dir}/meta.json") as f:
-            set_case_terms(set(json.load(f).get("case_terms", [])))
+            meta = json.load(f)
+        indexer.set_case_terms(indexer._load_case_terms(index_dir, meta))
         custom_scorer.build_native(index_dir)
         _INDEX = "native"  # non-None sentinel; scoring lives in custom_scorer
     except ImportError:

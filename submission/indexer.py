@@ -373,7 +373,8 @@ def _unpack_blocks(data: bytes, pos: int, m: int) -> Tuple[List[int], int]:
     return out, r.pos
 
 
-def _encode_postings(ords: List[int], tfs: List[int], N: int) -> bytes:
+def _encode_postings(ords: List[int], tfs: List[int], N: int,
+                     all_tf_one: bool = False) -> bytes:
     m = len(ords)
     l = _ef_l(m, N)
     out = bytearray()
@@ -390,11 +391,13 @@ def _encode_postings(ords: List[int], tfs: List[int], N: int) -> bytes:
         hw.put(1, 1)           # terminating one bit
         prev = hi
     out += hw.flush()
-    out += _pack_blocks([t - 1 for t in tfs])
+    if not all_tf_one:
+        out += _pack_blocks([t - 1 for t in tfs])
     return bytes(out)
 
 
-def _decode_postings(data: bytes, pos: int, df: int, N: int) -> Tuple[List[int], List[int], int]:
+def _decode_postings(data: bytes, pos: int, df: int, N: int,
+                     all_tf_one: bool = False) -> Tuple[List[int], List[int], int]:
     m = df
     l = _ef_l(m, N)
     low_bytes = (m * l + 7) // 8
@@ -412,8 +415,12 @@ def _decode_postings(data: bytes, pos: int, df: int, N: int) -> Tuple[List[int],
         else:
             cur += 1
     hr.align()
-    tfm1, pos = _unpack_blocks(data, hr.pos, m)
-    tfs = [x + 1 for x in tfm1]
+    if all_tf_one:
+        tfs = [1] * m
+        pos = hr.pos
+    else:
+        tfm1, pos = _unpack_blocks(data, hr.pos, m)
+        tfs = [x + 1 for x in tfm1]
     return ords, tfs, pos
 
 
@@ -484,6 +491,72 @@ def _decode_terms(data: bytes) -> Tuple[List[str], List[int]]:
         dfs.append(df)
         prev = term
     return terms, dfs
+
+
+def _encode_case_terms(terms: set) -> bytes:
+    """Front-code the case-sensitive vocabulary used by query tokenization."""
+    out = bytearray(b"CT1")
+    prev = ""
+    for term in sorted(terms):
+        shared = 0
+        limit = min(len(prev), len(term))
+        while shared < limit and prev[shared] == term[shared]:
+            shared += 1
+        suffix = term[shared:].encode("utf-8")
+        out += _vbyte_encode([shared, len(suffix)])
+        out += suffix
+        prev = term
+    return bytes(out)
+
+
+def _decode_case_terms(data: bytes) -> set:
+    """Decode a CT1 case-term sidecar."""
+    if not data.startswith(b"CT1"):
+        return set()
+    terms = set()
+    pos = 3
+    prev = ""
+    while pos < len(data):
+        (shared, suffix_len), pos = _vbyte_decode_n(data, pos, 2)
+        suffix = data[pos:pos + suffix_len].decode("utf-8")
+        pos += suffix_len
+        term = prev[:shared] + suffix
+        terms.add(term)
+        prev = term
+    return terms
+
+
+def _load_case_terms(index_dir: str, meta: dict) -> set:
+    """Read compact case terms, falling back to legacy meta.json."""
+    try:
+        with open(f"{index_dir}/case_terms.bin", "rb") as f:
+            return _decode_case_terms(f.read())
+    except FileNotFoundError:
+        return set(meta.get("case_terms", []))
+
+
+def _pack_docid(doc_id: str):
+    if len(doc_id) != 8 or any(c not in "0123456789abcdefghijklmnopqrstuvwxyz" for c in doc_id):
+        return None
+    value = 0
+    for c in doc_id:
+        value = value * 36 + (ord(c) - 48 if c <= "9" else ord(c) - 87)
+    return value.to_bytes(6, "little")
+
+
+def _decode_docids(data: bytes) -> List[str]:
+    if not data.startswith(b"D36\x01"):
+        return []
+    out = []
+    for pos in range(4, len(data), 6):
+        value = int.from_bytes(data[pos:pos + 6], "little")
+        chars = ["0"] * 8
+        for i in range(7, -1, -1):
+            digit = value % 36
+            chars[i] = chr(48 + digit) if digit < 10 else chr(87 + digit)
+            value //= 36
+        out.append("".join(chars))
+    return out
 
 
 class InvertedIndex:
@@ -598,7 +671,8 @@ class InvertedIndex:
     # the readable v0 baseline.
     #
     # Files written to index_dir:
-    #   meta.json    - N, avg_doc_len, case_terms
+    #   meta.json    - N, avg_doc_len
+    #   case_terms.bin - CT1 front-coded case-sensitive vocabulary
     #   docs.txt     - N lines "doc_id<TAB>doc_len"; line number = ordinal
     #   terms.txt    - vocab lines "term<TAB>df", in postings.bin block order
     #   postings.bin - per term: VByte(gaps of sorted doc ordinals) then
@@ -623,11 +697,21 @@ class InvertedIndex:
         # A4: docs.txt holds ONLY verbatim doc-id lines (doc_id strings must
         # survive verbatim — they're matched against qrels); lengths move to
         # their own VByte stream, doclen.bin, in the same doc order.
-        docid_to_ord = {}
-        with open(f"{index_dir}/docs.txt", "w") as f:
-            for doc_id in self.doc_len:
-                docid_to_ord[doc_id] = len(docid_to_ord)
-                f.write(f"{doc_id}\n")
+        docid_to_ord = {doc_id: i for i, doc_id in enumerate(self.doc_len)}
+        packed_ids = [_pack_docid(doc_id) for doc_id in self.doc_len]
+        if all(value is not None for value in packed_ids):
+            with open(f"{index_dir}/docids.bin", "wb") as f:
+                f.write(b"D36\x01")
+                for value in packed_ids:
+                    f.write(value)
+            if os.path.exists(f"{index_dir}/docs.txt"):
+                os.remove(f"{index_dir}/docs.txt")
+        else:
+            if os.path.exists(f"{index_dir}/docids.bin"):
+                os.remove(f"{index_dir}/docids.bin")
+            with open(f"{index_dir}/docs.txt", "w") as f:
+                for doc_id in self.doc_len:
+                    f.write(f"{doc_id}\n")
         with open(f"{index_dir}/doclen.bin", "wb") as f:
             f.write(_vbyte_encode(list(self.doc_len.values())))
 
@@ -640,18 +724,25 @@ class InvertedIndex:
 
         term_meta = []  # (term, df)
         blob = bytearray()
+        tf_one = bytearray(b"TF1" + b"\0" * ((len(terms_sorted) + 7) // 8))
         for term in terms_sorted:
             plist = self.postings[term]
             items = sorted((docid_to_ord[d], tf) for d, tf in plist.items())
             ords = [o for o, _ in items]
             tfs = [tf for _, tf in items]
-            blob += _encode_postings(ords, tfs, self.N)  # Elias-Fano codec
+            all_one = all(tf == 1 for tf in tfs)
+            if all_one:
+                i = len(term_meta)
+                tf_one[3 + i // 8] |= 1 << (i % 8)
+            blob += _encode_postings(ords, tfs, self.N, all_one)  # Elias-Fano codec
             term_meta.append((term, len(ords)))
 
         with open(f"{index_dir}/terms.txt", "wb") as f:
             f.write(_encode_terms(term_meta))
         with open(f"{index_dir}/postings.bin", "wb") as f:
             f.write(bytes(blob))
+        with open(f"{index_dir}/tf1.bin", "wb") as f:
+            f.write(tf_one)
 
         # No forward.bin is persisted: the forward index (doc -> [(term_ord,
         # tf)]) that RM3 needs is a byte-for-byte redundant transpose of the
@@ -660,10 +751,9 @@ class InvertedIndex:
         # size for zero extra information.
 
         with open(f"{index_dir}/meta.json", "w") as f:
-            json.dump(
-                {"N": self.N, "avg_doc_len": self.avg_doc_len, "case_terms": list(case_terms)},
-                f,
-            )
+            json.dump({"N": self.N, "avg_doc_len": self.avg_doc_len}, f)
+        with open(f"{index_dir}/case_terms.bin", "wb") as f:
+            f.write(_encode_case_terms(case_terms))
 
     @classmethod
     def load_v2(cls, index_dir: str) -> "InvertedIndex":
@@ -672,12 +762,17 @@ class InvertedIndex:
             meta = json.load(f)
         index.N = meta["N"]
         index.avg_doc_len = meta["avg_doc_len"]
-        set_case_terms(set(meta.get("case_terms", [])))
+        set_case_terms(_load_case_terms(index_dir, meta))
 
-        ord_to_docid = []
-        with open(f"{index_dir}/docs.txt") as f:
-            for line in f:
-                ord_to_docid.append(line.rstrip("\n"))
+        packed_path = f"{index_dir}/docids.bin"
+        if os.path.exists(packed_path):
+            with open(packed_path, "rb") as f:
+                ord_to_docid = _decode_docids(f.read())
+        else:
+            ord_to_docid = []
+            with open(f"{index_dir}/docs.txt") as f:
+                for line in f:
+                    ord_to_docid.append(line.rstrip("\n"))
         with open(f"{index_dir}/doclen.bin", "rb") as f:
             lens, _ = _vbyte_decode_n(f.read(), 0, len(ord_to_docid))
         for doc_id, dl in zip(ord_to_docid, lens):
@@ -685,10 +780,31 @@ class InvertedIndex:
 
         with open(f"{index_dir}/postings.bin", "rb") as f:
             blob = f.read()
+        try:
+            with open(f"{index_dir}/tf1.bin", "rb") as f:
+                tf_one = f.read()
+        except FileNotFoundError:
+            tf_one = b""
         with open(f"{index_dir}/terms.txt", "rb") as f:
             terms, dfs = _decode_terms(f.read())
 
-        for term, (ords, tfs) in zip(terms, _decode_all(blob, dfs, index.N)):
+        tf_flags = [
+            bool(
+                tf_one.startswith(b"TF1")
+                and len(tf_one) >= 3 + (len(terms) + 7) // 8
+                and ((tf_one[3 + i // 8] >> (i % 8)) & 1)
+            )
+            for i in range(len(terms))
+        ]
+        decoded = []
+        pos = 0
+        for i, df in enumerate(dfs):
+            ords, tfs, pos = _decode_postings(
+                blob, pos, df, index.N, tf_flags[i]
+            )
+            decoded.append((ords, tfs))
+
+        for term, (ords, tfs) in zip(terms, decoded):
             index.postings[term] = {
                 ord_to_docid[o]: tf for o, tf in zip(ords, tfs)
             }
