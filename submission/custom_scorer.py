@@ -5,7 +5,7 @@ from typing import List, Tuple
 
 from submission import bm25
 from submission import boolean_vsm
-from submission.indexer import InvertedIndex, tokenize
+from submission.indexer import InvertedIndex
 
 USE_RM3 = os.environ.get("SRE_RM3", "1") != "0"
 
@@ -61,67 +61,29 @@ def build_native(index_dir: str) -> None:
     """Native-path setup: the C++ side owns the postings and does the scoring."""
     global _NATIVE
     from submission._index_cpp import NativeIndex
+    from submission.indexer import _STEMMED_STOPWORDS
 
-    _NATIVE = NativeIndex(index_dir)
+    _NATIVE = NativeIndex(index_dir, list(_STEMMED_STOPWORDS))
 
 
 def score(query: str, k: int) -> List[Tuple[str, float]]:
     """Return up to k (doc_id, final_score) pairs for `query`, best first."""
     if _NATIVE is not None:
-        tokens = tokenize(query)
-        # VSM always scores the ORIGINAL query — the fusion pays for arm
-        # disagreement, so expanding both arms would erode the gain.
-        # arms() runs the RM3/BM25 and VSM arms on two C++ threads with the GIL
-        # released, so the cheaper VSM arm hides under the RM3 arm's latency.
-        # The rm3-vs-bm25 choice (USE_RM3 && has_forward) is made inside arms().
-        bm_hits, vs_hits = _NATIVE.arms(
-            tokens, USE_RM3, RM3_R, RM3_M, RM3_LAMBDA,
+        # Exactly one pybind call in and one result conversion out. NativeIndex
+        # tokenises the raw query, runs both scoring arms, computes the two
+        # rerank signals, fuses, reranks, and returns only the final top-k.
+        return _NATIVE.retrieve(
+            query, k, USE_RM3, RM3_R, RM3_M, RM3_LAMBDA,
             BM25_K1, BM25_B, _CAND, RM3_FB_TEMP, RM3_NOVEL,
-            RM3_K1_ROUND2, RM3_B_ROUND2)
-        coverage_hits = _NATIVE.coverage(tokens, _CAND, True)
-        early_hits = _NATIVE.early_match(tokens, _CAND)
-    else:
-        bm_hits = bm25.score(query, _CAND, k1=BM25_K1, b=BM25_B)
-        vs_hits = boolean_vsm.vsm_score(query, _CAND)
+            RM3_K1_ROUND2, RM3_B_ROUND2, RRF_K, W_BM,
+            _COVERAGE_RERANK_ALPHA, _COVERAGE_RERANK_DEPTH,
+            _EARLY_RERANK_ALPHA,
+        )
 
+    bm_hits = bm25.score(query, _CAND, k1=BM25_K1, b=BM25_B)
+    vs_hits = boolean_vsm.vsm_score(query, _CAND)
     fused = {}
     for hits, weight in ((bm_hits, W_BM), (vs_hits, 1 - W_BM)):
         for rank, (doc_id, _) in enumerate(hits, start=1):
-            fused[doc_id] = (
-                fused.get(doc_id, 0.0) + weight / (RRF_K + rank)
-            )
-
-    ranked = sorted(fused.items(), key=lambda x: (-x[1], x[0]))
-    if _NATIVE is not None and _COVERAGE_RERANK_ALPHA > 0.0:
-        coverage = dict(coverage_hits)
-        early = dict(early_hits)
-        depth = min(_COVERAGE_RERANK_DEPTH, len(ranked))
-        head = ranked[:depth]
-        fmax = head[0][1] if head else 0.0
-        cmax = max((coverage.get(doc_id, 0.0) for doc_id, _ in head), default=0.0)
-        if fmax > 0.0 and cmax > 0.0:
-            head = [
-                (
-                    doc_id,
-                    fused_score / fmax
-                    + _COVERAGE_RERANK_ALPHA
-                    * coverage.get(doc_id, 0.0) / cmax,
-                )
-                for doc_id, fused_score in head
-            ]
-            head.sort(key=lambda x: (-x[1], x[0]))
-            ranked = head + ranked[depth:]
-        if _EARLY_RERANK_ALPHA > 0.0:
-            qden = max(1, len(set(tokens)))
-            depth = min(_COVERAGE_RERANK_DEPTH, len(ranked))
-            head = [
-                (
-                    doc_id,
-                    fused_score + _EARLY_RERANK_ALPHA
-                    * early.get(doc_id, 0.0) / qden,
-                )
-                for doc_id, fused_score in ranked[:depth]
-            ]
-            head.sort(key=lambda x: (-x[1], x[0]))
-            ranked = head + ranked[depth:]
-    return ranked[:k]
+            fused[doc_id] = fused.get(doc_id, 0.0) + weight / (RRF_K + rank)
+    return sorted(fused.items(), key=lambda x: (-x[1], x[0]))[:k]

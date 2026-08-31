@@ -4,7 +4,8 @@
 // Declarations only; definitions live in tokenizer.cpp, which is compiled into
 // each extension module (see setup.py). This lets the build path tokenise a
 // document entirely in C++ (SpimiBuilder owns a Tokenizer) so tokens never
-// materialise as a Python list, while the query path still returns a list.
+// materialise as a Python list. NativeIndex also owns one for its one-call
+// retrieve path; the standalone _stem_cpp query helper still returns a list.
 //
 // The implementation is a byte-for-byte port of nltk's EnglishStemmer.stem and
 // indexer._tokenize_python. Do not alter the algorithm without re-validating

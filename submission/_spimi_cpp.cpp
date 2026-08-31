@@ -9,11 +9,10 @@
 // case_terms.bin sidecars.
 //
 // Purpose is OOM-safety on large corpora: peak memory is one block plus the
-// streaming merge, never the whole postings set. Tokenisation is fused in via
-// the shared Tokenizer (tokenizer.h): add_document_from_text(doc_id, text)
-// tokenises+stems the document entirely in C++, so the token list never crosses
-// into Python during the build. add_document(doc_id, tokens, len) is kept for
-// the pure-Python fallback and tests.
+// streaming merge, never the whole postings set. build_index_from_jsonl()
+// performs file reading, JSON decoding, worker threading, tokenisation, and
+// indexing behind one pybind call. add_document_from_text() and add_document()
+// remain exposed for compatibility, tuning, and tests.
 //
 // Optional + drop-in: retrieve.build_index() uses this if built and falls
 // back to InvertedIndex().build()+save_v2() otherwise.
@@ -32,8 +31,15 @@
 #include <cstdint>
 #include <cmath>
 #include <cctype>
+#include <cerrno>
+#include <dirent.h>
+#include <exception>
 #include <iomanip>
 #include <limits>
+#include <stdexcept>
+#include <sys/stat.h>
+#include <thread>
+#include <unistd.h>
 
 namespace py = pybind11;
 
@@ -49,6 +55,280 @@ static bool has_upper(const std::string &text) {
     return std::any_of(text.begin(), text.end(), [](char c) {
         return c >= 'A' && c <= 'Z';
     });
+}
+
+static bool is_blank_line(const std::string &line) {
+    return std::all_of(line.begin(), line.end(), [](unsigned char c) {
+        return std::isspace(c) != 0;
+    });
+}
+
+static void ensure_directory(const std::string &path) {
+    if (::mkdir(path.c_str(), 0755) != 0 && errno != EEXIST)
+        throw std::runtime_error("cannot create directory: " + path);
+}
+
+static void remove_directory_tree(const std::string &path) {
+    DIR *directory = ::opendir(path.c_str());
+    if (!directory) return;
+    while (dirent *entry = ::readdir(directory)) {
+        std::string name = entry->d_name;
+        if (name == "." || name == "..") continue;
+        std::string child = path + "/" + name;
+        struct stat info {};
+        if (::lstat(child.c_str(), &info) == 0 && S_ISDIR(info.st_mode))
+            remove_directory_tree(child);
+        else
+            std::remove(child.c_str());
+    }
+    ::closedir(directory);
+    ::rmdir(path.c_str());
+}
+
+// Minimal standards-compliant JSON decoder for the corpus JSONL records. It
+// extracts string-valued doc_id/text fields, handles every JSON string escape
+// (including UTF-16 surrogate pairs), tolerates arbitrary field order and
+// extra fields, and rejects malformed records instead of silently indexing
+// corrupted text.
+class JsonCursor {
+public:
+    explicit JsonCursor(const std::string &source) : source_(source) {}
+
+    void skip_ws() {
+        while (pos_ < source_.size() &&
+               std::isspace(static_cast<unsigned char>(source_[pos_])))
+            pos_++;
+    }
+
+    bool consume(char expected) {
+        skip_ws();
+        if (pos_ < source_.size() && source_[pos_] == expected) {
+            pos_++;
+            return true;
+        }
+        return false;
+    }
+
+    void expect(char expected) {
+        if (!consume(expected))
+            fail(std::string("expected '") + expected + "'");
+    }
+
+    std::string parse_string() {
+        skip_ws();
+        if (pos_ >= source_.size() || source_[pos_] != '"')
+            fail("expected JSON string");
+        pos_++;
+        std::string out;
+        while (pos_ < source_.size()) {
+            unsigned char c = static_cast<unsigned char>(source_[pos_++]);
+            if (c == '"') return out;
+            if (c < 0x20) fail("unescaped control character in string");
+            if (c != '\\') {
+                out.push_back(static_cast<char>(c));
+                continue;
+            }
+            if (pos_ >= source_.size()) fail("unterminated escape");
+            char esc = source_[pos_++];
+            switch (esc) {
+                case '"': out.push_back('"'); break;
+                case '\\': out.push_back('\\'); break;
+                case '/': out.push_back('/'); break;
+                case 'b': out.push_back('\b'); break;
+                case 'f': out.push_back('\f'); break;
+                case 'n': out.push_back('\n'); break;
+                case 'r': out.push_back('\r'); break;
+                case 't': out.push_back('\t'); break;
+                case 'u': {
+                    uint32_t codepoint = parse_hex4();
+                    if (codepoint >= 0xD800 && codepoint <= 0xDBFF) {
+                        if (pos_ + 2 > source_.size() ||
+                            source_[pos_] != '\\' || source_[pos_ + 1] != 'u')
+                            fail("high surrogate without low surrogate");
+                        pos_ += 2;
+                        uint32_t low = parse_hex4();
+                        if (low < 0xDC00 || low > 0xDFFF)
+                            fail("invalid low surrogate");
+                        codepoint = 0x10000 +
+                            ((codepoint - 0xD800) << 10) + (low - 0xDC00);
+                    } else if (codepoint >= 0xDC00 && codepoint <= 0xDFFF) {
+                        fail("unexpected low surrogate");
+                    }
+                    append_utf8(out, codepoint);
+                    break;
+                }
+                default:
+                    fail("invalid string escape");
+            }
+        }
+        fail("unterminated JSON string");
+    }
+
+    void skip_value() {
+        skip_ws();
+        if (pos_ >= source_.size()) fail("expected JSON value");
+        char c = source_[pos_];
+        if (c == '"') {
+            parse_string();
+        } else if (c == '{') {
+            pos_++;
+            skip_ws();
+            if (consume('}')) return;
+            while (true) {
+                parse_string();
+                expect(':');
+                skip_value();
+                if (consume('}')) return;
+                expect(',');
+            }
+        } else if (c == '[') {
+            pos_++;
+            skip_ws();
+            if (consume(']')) return;
+            while (true) {
+                skip_value();
+                if (consume(']')) return;
+                expect(',');
+            }
+        } else if (c == 't') {
+            consume_literal("true");
+        } else if (c == 'f') {
+            consume_literal("false");
+        } else if (c == 'n') {
+            consume_literal("null");
+        } else {
+            skip_number();
+        }
+    }
+
+    bool at_end() {
+        skip_ws();
+        return pos_ == source_.size();
+    }
+
+private:
+    const std::string &source_;
+    size_t pos_ = 0;
+
+    [[noreturn]] void fail(const std::string &message) const {
+        throw std::runtime_error(
+            "invalid JSON at byte " + std::to_string(pos_) + ": " + message);
+    }
+
+    static int hex_value(char c) {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    }
+
+    uint32_t parse_hex4() {
+        if (pos_ + 4 > source_.size()) fail("truncated unicode escape");
+        uint32_t value = 0;
+        for (int i = 0; i < 4; i++) {
+            int digit = hex_value(source_[pos_++]);
+            if (digit < 0) fail("invalid unicode escape");
+            value = (value << 4) | static_cast<uint32_t>(digit);
+        }
+        return value;
+    }
+
+    static void append_utf8(std::string &out, uint32_t codepoint) {
+        if (codepoint <= 0x7F) {
+            out.push_back(static_cast<char>(codepoint));
+        } else if (codepoint <= 0x7FF) {
+            out.push_back(static_cast<char>(0xC0 | (codepoint >> 6)));
+            out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+        } else if (codepoint <= 0xFFFF) {
+            out.push_back(static_cast<char>(0xE0 | (codepoint >> 12)));
+            out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+        } else {
+            out.push_back(static_cast<char>(0xF0 | (codepoint >> 18)));
+            out.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+        }
+    }
+
+    void consume_literal(const char *literal) {
+        size_t begin = pos_;
+        while (*literal != '\0') {
+            if (pos_ >= source_.size() || source_[pos_] != *literal)
+                fail("invalid literal");
+            pos_++;
+            literal++;
+        }
+        if (pos_ == begin) fail("invalid literal");
+    }
+
+    void skip_number() {
+        size_t begin = pos_;
+        if (source_[pos_] == '-') pos_++;
+        if (pos_ >= source_.size()) fail("invalid number");
+        if (source_[pos_] == '0') {
+            pos_++;
+        } else if (source_[pos_] >= '1' && source_[pos_] <= '9') {
+            while (pos_ < source_.size() &&
+                   source_[pos_] >= '0' && source_[pos_] <= '9')
+                pos_++;
+        } else {
+            fail("invalid number");
+        }
+        if (pos_ < source_.size() && source_[pos_] == '.') {
+            pos_++;
+            size_t fraction = pos_;
+            while (pos_ < source_.size() &&
+                   source_[pos_] >= '0' && source_[pos_] <= '9')
+                pos_++;
+            if (pos_ == fraction) fail("invalid number fraction");
+        }
+        if (pos_ < source_.size() &&
+            (source_[pos_] == 'e' || source_[pos_] == 'E')) {
+            pos_++;
+            if (pos_ < source_.size() &&
+                (source_[pos_] == '+' || source_[pos_] == '-'))
+                pos_++;
+            size_t exponent = pos_;
+            while (pos_ < source_.size() &&
+                   source_[pos_] >= '0' && source_[pos_] <= '9')
+                pos_++;
+            if (pos_ == exponent) fail("invalid number exponent");
+        }
+        if (pos_ == begin) fail("invalid number");
+    }
+};
+
+static std::pair<std::string, std::string>
+parse_corpus_record(const std::string &line) {
+    JsonCursor json(line);
+    json.expect('{');
+    std::string doc_id;
+    std::string text;
+    bool have_doc_id = false;
+    bool have_text = false;
+    if (!json.consume('}')) {
+        while (true) {
+            std::string key = json.parse_string();
+            json.expect(':');
+            if (key == "doc_id") {
+                doc_id = json.parse_string();
+                have_doc_id = true;
+            } else if (key == "text") {
+                text = json.parse_string();
+                have_text = true;
+            } else {
+                json.skip_value();
+            }
+            if (json.consume('}')) break;
+            json.expect(',');
+        }
+    }
+    if (!json.at_end())
+        throw std::runtime_error("trailing content after JSON object");
+    if (!have_doc_id || !have_text)
+        throw std::runtime_error("record must contain string doc_id and text fields");
+    return {std::move(doc_id), std::move(text)};
 }
 
 static void put_vbyte(std::string &out, long n) {
@@ -672,30 +952,18 @@ struct SpimiBuilder {
 //    put_case_terms() sorts the retained case-sensitive terms before
 //    writing case_terms.bin, so unordered_set iteration order no
 //    longer affects the serialized bytes.
-void finalize_parallel(const py::list &workers, const std::string &out_dir,
-                        const std::unordered_map<std::string, std::string> &canonical,
-                        double df_ratio) {
-    struct WorkerData {
-        std::vector<std::string> block_files;
-        std::string docs_txt;
-        std::string doclen_bin;
-        uint32_t n_docs;  // LOCAL doc count for this worker (not a global
-                           // ordinal) — see SpimiBuilder::get_local_docs.
-        long total_len;
-    };
+struct WorkerData {
+    std::vector<std::string> block_files;
+    std::string docs_txt;
+    std::string doclen_bin;
+    uint32_t n_docs;  // LOCAL doc count for this worker (not a global ordinal).
+    long total_len;
+};
 
-    std::vector<WorkerData> ws;
-    for (auto &item : workers) {
-        py::dict d = item.cast<py::dict>();
-        WorkerData w;
-        w.block_files = d["block_files"].cast<std::vector<std::string>>();
-        w.docs_txt = d["docs_txt"].cast<std::string>();
-        w.doclen_bin = d["doclen_bin"].cast<std::string>();
-        w.n_docs = d["n_docs"].cast<uint32_t>();
-        w.total_len = d["total_len"].cast<long>();
-        ws.push_back(std::move(w));
-    }
-
+static void finalize_worker_data(
+    const std::vector<WorkerData> &ws, const std::string &out_dir,
+    const std::unordered_map<std::string, std::string> &canonical,
+    double df_ratio) {
     // Concatenate docs.txt / doclen.bin shards in worker order == global
     // doc-ordinal order (A4: doc-id lines and VByte lengths are now two
     // separate parallel streams; both concatenate the same way).
@@ -736,6 +1004,150 @@ void finalize_parallel(const py::list &workers, const std::string &out_dir,
     }
 }
 
+void finalize_parallel(const py::list &workers, const std::string &out_dir,
+                       const std::unordered_map<std::string, std::string> &canonical,
+                       double df_ratio) {
+    std::vector<WorkerData> ws;
+    for (auto &item : workers) {
+        py::dict d = item.cast<py::dict>();
+        WorkerData w;
+        w.block_files = d["block_files"].cast<std::vector<std::string>>();
+        w.docs_txt = d["docs_txt"].cast<std::string>();
+        w.doclen_bin = d["doclen_bin"].cast<std::string>();
+        w.n_docs = d["n_docs"].cast<uint32_t>();
+        w.total_len = d["total_len"].cast<long>();
+        ws.push_back(std::move(w));
+    }
+    finalize_worker_data(ws, out_dir, canonical, df_ratio);
+}
+
+void build_index_from_jsonl(
+    const std::string &corpus_path, const std::string &index_dir,
+    const std::vector<std::string> &stopword_stems,
+    size_t worker_flush_threshold, int requested_workers, double df_ratio) {
+    std::ifstream scan(corpus_path, std::ios::binary);
+    if (!scan)
+        throw std::runtime_error("cannot open corpus: " + corpus_path);
+
+    std::vector<uint64_t> offsets;
+    std::string line;
+    while (true) {
+        std::streampos position = scan.tellg();
+        if (!std::getline(scan, line)) break;
+        if (!is_blank_line(line))
+            offsets.push_back(static_cast<uint64_t>(position));
+    }
+
+    if (offsets.empty()) {
+        finalize_worker_data({}, index_dir, {}, df_ratio);
+        return;
+    }
+
+    int worker_count = std::min<int>(
+        std::max(1, requested_workers), static_cast<int>(offsets.size()));
+    std::vector<WorkerData> workers(static_cast<size_t>(worker_count));
+    std::vector<std::unordered_set<std::string>> worker_case_terms(
+        static_cast<size_t>(worker_count));
+    std::vector<std::exception_ptr> errors(static_cast<size_t>(worker_count));
+    std::vector<std::string> worker_dirs(static_cast<size_t>(worker_count));
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<size_t>(worker_count));
+
+    size_t base = offsets.size() / static_cast<size_t>(worker_count);
+    size_t remainder = offsets.size() % static_cast<size_t>(worker_count);
+    size_t start = 0;
+    for (int worker_id = 0; worker_id < worker_count; worker_id++) {
+        size_t count = base + (
+            static_cast<size_t>(worker_id) < remainder ? 1u : 0u);
+        size_t worker_start = start;
+        uint32_t start_ordinal = static_cast<uint32_t>(start);
+        std::string worker_dir =
+            index_dir + "/_w" + std::to_string(worker_id);
+        worker_dirs[static_cast<size_t>(worker_id)] = worker_dir;
+        start += count;
+
+        threads.emplace_back([&, worker_id, count, worker_start,
+                              start_ordinal, worker_dir] {
+            try {
+                remove_directory_tree(worker_dir);
+                ensure_directory(worker_dir);
+                SpimiBuilder builder(
+                    worker_dir, std::max<size_t>(1, worker_flush_threshold),
+                    start_ordinal);
+                builder.set_stopword_stems(stopword_stems);
+
+                std::ifstream input(corpus_path, std::ios::binary);
+                if (!input)
+                    throw std::runtime_error("cannot open corpus: " + corpus_path);
+                input.seekg(static_cast<std::streamoff>(offsets[worker_start]));
+                if (!input)
+                    throw std::runtime_error("cannot seek corpus: " + corpus_path);
+
+                size_t documents_read = 0;
+                std::string worker_line;
+                while (documents_read < count &&
+                       std::getline(input, worker_line)) {
+                    if (is_blank_line(worker_line)) continue;
+                    try {
+                        auto record = parse_corpus_record(worker_line);
+                        builder.add_document_from_text(
+                            record.first, record.second);
+                    } catch (const std::exception &error) {
+                        throw std::runtime_error(
+                            "corpus record " +
+                            std::to_string(worker_start + documents_read + 1) +
+                            ": " + error.what());
+                    }
+                    documents_read++;
+                }
+                if (documents_read != count)
+                    throw std::runtime_error(
+                        "corpus ended before assigned worker range");
+
+                builder.close_worker();
+                WorkerData result;
+                result.block_files = builder.get_block_files();
+                result.docs_txt = builder.docs_path();
+                result.doclen_bin = builder.doclen_path();
+                result.n_docs = builder.get_local_docs();
+                result.total_len = builder.get_total_len();
+                workers[static_cast<size_t>(worker_id)] = std::move(result);
+                auto terms = builder.case_terms();
+                worker_case_terms[static_cast<size_t>(worker_id)].insert(
+                    terms.begin(), terms.end());
+            } catch (...) {
+                errors[static_cast<size_t>(worker_id)] =
+                    std::current_exception();
+            }
+        });
+    }
+
+    for (auto &thread : threads) thread.join();
+    for (const auto &error : errors) {
+        if (error) {
+            for (const auto &worker_dir : worker_dirs)
+                remove_directory_tree(worker_dir);
+            std::rethrow_exception(error);
+        }
+    }
+
+    std::unordered_map<std::string, std::string> canonical;
+    for (const auto &case_terms : worker_case_terms) {
+        for (const auto &term : case_terms)
+            canonical[term] = Tokenizer::stem(term);
+    }
+
+    try {
+        finalize_worker_data(workers, index_dir, canonical, df_ratio);
+    } catch (...) {
+        for (const auto &worker_dir : worker_dirs)
+            remove_directory_tree(worker_dir);
+        throw;
+    }
+    for (const auto &worker_dir : worker_dirs)
+        ::rmdir(worker_dir.c_str());
+}
+
 PYBIND11_MODULE(_spimi_cpp, m) {
     m.doc() = "SPIMI index builder: block flushing and compact v2 serialization.";
     py::class_<SpimiBuilder>(m, "SpimiBuilder")
@@ -757,4 +1169,9 @@ PYBIND11_MODULE(_spimi_cpp, m) {
         .def("doclen_path", &SpimiBuilder::doclen_path);
     m.def("finalize_parallel", &finalize_parallel,
           py::arg("workers"), py::arg("out_dir"), py::arg("canonical"), py::arg("df_ratio"));
+    m.def("build_index_from_jsonl", &build_index_from_jsonl,
+          py::arg("corpus_path"), py::arg("index_dir"),
+          py::arg("stopword_stems"), py::arg("worker_flush_threshold"),
+          py::arg("workers"), py::arg("df_ratio"),
+          py::call_guard<py::gil_scoped_release>());
 }

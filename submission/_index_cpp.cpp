@@ -5,10 +5,10 @@
 // contiguous C++ arrays. It owns native BM25/VSM scoring, coverage and early
 // matching, RM3 support, and reconstruction of the forward view needed by RM3.
 //
-// Query tokenisation is performed by indexer.tokenize(), which may use the
-// optional _stem_cpp extension. RRF fusion and final reranking remain in
-// Python. retrieve.py uses this module when built and falls back to the pure
-// Python InvertedIndex/scorer path otherwise.
+// The primary retrieve() binding accepts the raw query and performs
+// tokenisation, scoring, RRF fusion, and final reranking entirely in C++, so a
+// query and its final top-k cross the Python/native boundary only once each.
+// The component methods remain exposed for tuning scripts and diagnostics.
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -21,6 +21,8 @@
 #include <fstream>
 #include <cstdint>
 #include <thread>
+
+#include "tokenizer.h"
 
 namespace py = pybind11;
 
@@ -43,8 +45,14 @@ struct NativeIndex {
     std::vector<size_t> fwd_off;
     std::vector<int> fwd_terms;
     std::vector<int> fwd_tfs;
+    Tokenizer query_tok;
 
-    explicit NativeIndex(const std::string &dir) { load(dir); }
+    explicit NativeIndex(
+        const std::string &dir,
+        const std::vector<std::string> &stopword_stems = {}) {
+        query_tok.set_stopword_stems(stopword_stems);
+        load(dir);
+    }
 
     static std::string read_binary(const std::string &path) {
         std::ifstream file(path, std::ios::binary);
@@ -635,8 +643,9 @@ struct NativeIndex {
     // and each owns its score/touched buffers, so concurrent reads are safe
     // with no locking. The VSM arm runs on a worker thread while this thread
     // runs the (heavier) RM3/BM25 arm. Called with the GIL released (see the
-    // pybind def), so the two C++ threads run truly in parallel. Fusion (RRF)
-    // stays in Python. Returns {bm_hits, vs_hits}.
+    // pybind def), so the two C++ threads run truly in parallel. Returns
+    // {bm_hits, vs_hits}; retrieve() consumes these internally, while the
+    // binding remains exposed for tuning scripts.
     std::pair<std::vector<std::pair<std::string, double>>,
               std::vector<std::pair<std::string, double>>>
     arms(const std::vector<std::string> &tokens, bool use_rm3,
@@ -653,12 +662,119 @@ struct NativeIndex {
         vt.join();
         return {bm_hits, vs_hits};
     }
+
+    // Complete query pipeline behind one pybind boundary. The raw query enters
+    // once and only the final top-k leaves: tokenisation, both retrieval arms,
+    // coverage/early signals, RRF fusion, and reranking all stay in C++.
+    std::vector<std::pair<std::string, double>>
+    retrieve(const std::string &query, int k, bool use_rm3,
+             int R, int M, double lambda_, double k1, double b, int cand,
+             double fb_temp, bool novel_only,
+             double k1_round2, double b_round2,
+             int rrf_k, double w_bm,
+             double coverage_alpha, int rerank_depth,
+             double early_alpha) {
+        std::vector<std::string> raw_tokens;
+        query_tok.tokenize(query, raw_tokens);
+
+        // Match indexer.tokenize(): lowercase terms survive even when OOV;
+        // case-sensitive terms survive only if pruning kept them in the index.
+        std::vector<std::string> tokens;
+        tokens.reserve(raw_tokens.size());
+        for (const auto &tok : raw_tokens) {
+            bool lowercase = true;
+            for (unsigned char c : tok) {
+                if (c >= 'A' && c <= 'Z') {
+                    lowercase = false;
+                    break;
+                }
+            }
+            if (lowercase || term_id.find(tok) != term_id.end())
+                tokens.push_back(tok);
+        }
+
+        auto arm_hits = arms(
+            tokens, use_rm3, R, M, lambda_, k1, b, cand, fb_temp,
+            novel_only, k1_round2, b_round2);
+        auto coverage_hits = coverage(tokens, cand, true);
+        auto early_hits = early_match(tokens, cand);
+
+        std::unordered_map<std::string, double> fused;
+        for (size_t i = 0; i < arm_hits.first.size(); i++)
+            fused[arm_hits.first[i].first] +=
+                w_bm / static_cast<double>(rrf_k + i + 1);
+        for (size_t i = 0; i < arm_hits.second.size(); i++)
+            fused[arm_hits.second[i].first] +=
+                (1.0 - w_bm) / static_cast<double>(rrf_k + i + 1);
+
+        std::vector<std::pair<std::string, double>> ranked(
+            fused.begin(), fused.end());
+        auto rank_order = [](const auto &a, const auto &b) {
+            return a.second > b.second ||
+                   (a.second == b.second && a.first < b.first);
+        };
+        std::sort(ranked.begin(), ranked.end(), rank_order);
+
+        if (coverage_alpha > 0.0) {
+            std::unordered_map<std::string, double> coverage_score;
+            std::unordered_map<std::string, double> early_score;
+            for (const auto &hit : coverage_hits)
+                coverage_score[hit.first] = hit.second;
+            for (const auto &hit : early_hits)
+                early_score[hit.first] = hit.second;
+
+            size_t depth = std::min(
+                ranked.size(),
+                static_cast<size_t>(std::max(0, rerank_depth)));
+            double fmax = depth > 0 ? ranked[0].second : 0.0;
+            double cmax = 0.0;
+            for (size_t i = 0; i < depth; i++) {
+                auto it = coverage_score.find(ranked[i].first);
+                if (it != coverage_score.end())
+                    cmax = std::max(cmax, it->second);
+            }
+            if (fmax > 0.0 && cmax > 0.0) {
+                for (size_t i = 0; i < depth; i++) {
+                    double cov = 0.0;
+                    auto it = coverage_score.find(ranked[i].first);
+                    if (it != coverage_score.end()) cov = it->second;
+                    ranked[i].second =
+                        ranked[i].second / fmax + coverage_alpha * cov / cmax;
+                }
+                std::sort(ranked.begin(), ranked.begin() + depth, rank_order);
+            }
+
+            if (early_alpha > 0.0) {
+                std::unordered_set<std::string> unique_tokens(
+                    tokens.begin(), tokens.end());
+                double qden = static_cast<double>(
+                    std::max<size_t>(1, unique_tokens.size()));
+                depth = std::min(
+                    ranked.size(),
+                    static_cast<size_t>(std::max(0, rerank_depth)));
+                for (size_t i = 0; i < depth; i++) {
+                    double early = 0.0;
+                    auto it = early_score.find(ranked[i].first);
+                    if (it != early_score.end()) early = it->second;
+                    ranked[i].second += early_alpha * early / qden;
+                }
+                std::sort(ranked.begin(), ranked.begin() + depth, rank_order);
+            }
+        }
+
+        if (k < 0) k = 0;
+        if (ranked.size() > static_cast<size_t>(k))
+            ranked.resize(static_cast<size_t>(k));
+        return ranked;
+    }
 };
 
 PYBIND11_MODULE(_index_cpp, m) {
     m.doc() = "Native C++ inverted index: BM25 + VSM over the compressed postings.";
     py::class_<NativeIndex>(m, "NativeIndex")
-        .def(py::init<const std::string &>())
+        .def(py::init<const std::string &, const std::vector<std::string> &>(),
+             py::arg("index_dir"),
+             py::arg("stopword_stems") = std::vector<std::string>{})
         .def("bm25", &NativeIndex::bm25,
              py::arg("tokens"), py::arg("k1"), py::arg("b"), py::arg("k"))
         .def("coverage", &NativeIndex::coverage,
@@ -679,6 +795,16 @@ PYBIND11_MODULE(_index_cpp, m) {
              py::arg("fb_temp"), py::arg("novel_only"),
              py::arg("k1_round2") = -1.0,
              py::arg("b_round2") = -1.0,
+             py::call_guard<py::gil_scoped_release>())
+        .def("retrieve", &NativeIndex::retrieve,
+             py::arg("query"), py::arg("k"), py::arg("use_rm3"),
+             py::arg("R"), py::arg("M"), py::arg("lambda_"),
+             py::arg("k1"), py::arg("b"), py::arg("cand"),
+             py::arg("fb_temp"), py::arg("novel_only"),
+             py::arg("k1_round2"), py::arg("b_round2"),
+             py::arg("rrf_k"), py::arg("w_bm"),
+             py::arg("coverage_alpha"), py::arg("rerank_depth"),
+             py::arg("early_alpha"),
              py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("has_forward",
                                [](const NativeIndex &n) { return n.has_forward; });

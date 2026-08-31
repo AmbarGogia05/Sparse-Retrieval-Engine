@@ -17,9 +17,11 @@ from pybind11.setup_helpers import Pybind11Extension, build_ext
 from setuptools import setup
 
 ext_modules = [
-    Pybind11Extension("_index_cpp", ["_index_cpp.cpp"], cxx_std=17),
-    # _spimi_cpp and _stem_cpp share the tokenizer/stemmer (tokenizer.cpp); each
-    # extension compiles its own copy in (separate .so, no shared linkage).
+    # All three extensions embed the shared tokenizer/stemmer. _index_cpp uses
+    # it so one retrieve(raw_query, k, ...) binding call can perform the entire
+    # query pipeline without materialising tokens or intermediate rankings in
+    # Python.
+    Pybind11Extension("_index_cpp", ["_index_cpp.cpp", "tokenizer.cpp"], cxx_std=17),
     Pybind11Extension("_spimi_cpp", ["_spimi_cpp.cpp", "tokenizer.cpp"], cxx_std=17),
     Pybind11Extension("_stem_cpp", ["_stem_cpp.cpp", "tokenizer.cpp"], cxx_std=17),
 ]
