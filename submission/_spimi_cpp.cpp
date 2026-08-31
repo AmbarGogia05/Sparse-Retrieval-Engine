@@ -381,7 +381,8 @@ static SelectedTerms select_terms(
 static std::vector<TermPostings> merge_blocks(
     const std::vector<std::string> &block_files,
     const std::vector<std::string> &kept_terms,
-    const std::unordered_set<std::string> &pruned) {
+    const std::unordered_set<std::string> &pruned,
+    const std::map<std::string, uint32_t> &frequencies) {
     std::unordered_map<std::string, size_t> term_slot;
     term_slot.reserve(kept_terms.size() * 2);
     for (size_t i = 0; i < kept_terms.size(); i++)
@@ -403,21 +404,33 @@ static std::vector<TermPostings> merge_blocks(
         }
         if (!found) break;
 
-        std::vector<uint32_t> ords, tfs;
-        std::vector<uint8_t> early;
+        const bool discard = pruned.count(next_term) != 0;
+        TermPostings *postings = nullptr;
+        if (!discard) {
+            postings = &data[term_slot.at(next_term)];
+            // The preceding DF scan gives the final size across every block,
+            // so each output vector can allocate once instead of repeatedly
+            // growing as worker/block fragments are appended.
+            const size_t df = frequencies.at(next_term);
+            postings->ords.reserve(df);
+            postings->tfs.reserve(df);
+            postings->early.reserve(df);
+        }
+
         for (auto &reader : readers) {
             if (!reader.ok || reader.term != next_term) continue;
-            ords.insert(ords.end(), reader.ords.begin(), reader.ords.end());
-            tfs.insert(tfs.end(), reader.tfs.begin(), reader.tfs.end());
-            early.insert(early.end(), reader.early.begin(), reader.early.end());
+            // Pruned case variants still have to be consumed from each input
+            // block, but never copy them into temporary/final merge vectors.
+            if (!discard) {
+                postings->ords.insert(
+                    postings->ords.end(), reader.ords.begin(), reader.ords.end());
+                postings->tfs.insert(
+                    postings->tfs.end(), reader.tfs.begin(), reader.tfs.end());
+                postings->early.insert(
+                    postings->early.end(), reader.early.begin(), reader.early.end());
+            }
             reader.advance();
         }
-        if (pruned.count(next_term)) continue;
-
-        TermPostings &postings = data[term_slot.at(next_term)];
-        postings.ords = std::move(ords);
-        postings.tfs = std::move(tfs);
-        postings.early = std::move(early);
     }
     return data;
 }
@@ -629,7 +642,7 @@ struct SpimiBuilder {
         auto frequencies = scan_document_frequencies(block_files);
         auto selected = select_terms(frequencies, canonical, df_ratio);
         auto data = merge_blocks(
-            block_files, selected.kept, selected.pruned);
+            block_files, selected.kept, selected.pruned, frequencies);
         write_index(
             dir, selected.kept, data, selected.case_sensitive, n_docs, total_len);
 
@@ -711,7 +724,8 @@ void finalize_parallel(const py::list &workers, const std::string &out_dir,
 
     auto frequencies = scan_document_frequencies(all_blocks);
     auto selected = select_terms(frequencies, canonical, df_ratio);
-    auto data = merge_blocks(all_blocks, selected.kept, selected.pruned);
+    auto data = merge_blocks(
+        all_blocks, selected.kept, selected.pruned, frequencies);
     write_index(
         out_dir, selected.kept, data, selected.case_sensitive, N, total_len);
 
