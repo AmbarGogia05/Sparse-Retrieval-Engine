@@ -1,12 +1,4 @@
-"""
-submission/corpus_utils.py
-
-Small, shared, non-graded utility for reading the corpus format used
-throughout this assignment. You are welcome to use this as-is — reading a
-JSONL file is plumbing, not the ranking logic the assignment grades — or
-replace it if your index needs a different loading strategy (e.g.
-streaming instead of loading everything into memory).
-"""
+"""Read the assignment's JSONL corpus format."""
 import json
 from typing import List, Tuple
 

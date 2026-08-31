@@ -12,26 +12,18 @@ survives between them except what is written to index_dir.
 
 import json
 import os
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
+from submission import custom_scorer
 from submission.corpus_utils import load_corpus
 from submission.indexer import InvertedIndex
-from submission import custom_scorer
 
 # load_index() populates this; retrieve() reads it.
 _INDEX = None
 
-# SPIMI: flush the in-memory postings block once it holds this many postings.
-# ~40M postings ≈ 1.5 GB accumulator — well within an 8 GB budget alongside
-# the corpus text and interpreter, with headroom for the merge phase. Small
-# corpora (e.g. 171K docs ≈ 17M postings) stay a single in-memory block.
-#
-# The parallel build (see build_index) runs up to 4 of these accumulators
-# concurrently, one per worker process, on the same 8 GB machine — so each
-# worker's threshold is this value divided by the worker count, ~10M
-# postings (~375 MB) per worker. At this corpus's size (~11.5M postings
-# total, so ~2.9M per worker) no flush actually occurs either way; this is
-# insurance against OOM on a larger corpus, not a hot path here.
+# SPIMI: flush the in-memory postings block once it reaches this threshold.
+# The parallel build divides the threshold across its workers, bounding peak
+# memory while preserving the same final compact v2 bytes as the serial path.
 _SPIMI_FLUSH_POSTINGS = 40_000_000
 
 # Hard cap, not os.cpu_count(): the grading machine has 4 cores, and local
@@ -61,9 +53,15 @@ def _doc_line_offsets(corpus_path: str) -> List[int]:
 def _spimi_worker(args):
     """Runs in a worker process: tokenises and SPIMI-indexes one contiguous,
     globally-ordinalled slice of the corpus into its own scratch subdir.
-    Returns small metadata only (paths, vocab, counts) — no postings or doc
-    text cross the IPC boundary."""
-    corpus_path, start_byte, n_docs_to_read, start_ord, worker_dir, flush_threshold = args
+    Returns only the paths and counts needed by the parent merge."""
+    (
+        corpus_path,
+        start_byte,
+        n_docs_to_read,
+        start_ord,
+        worker_dir,
+        flush_threshold,
+    ) = args
     from submission._spimi_cpp import SpimiBuilder
     from submission import indexer
 
@@ -96,10 +94,8 @@ def _spimi_worker(args):
 
     return {
         "block_files": builder.block_files(),
-        "vocab": builder.vocab(),
         "docs_txt": builder.docs_path(),
         "doclen_bin": builder.doclen_path(),
-        "forward_tmp": builder.forward_tmp_path(),
         "n_docs": builder.n_docs_count(),
         "total_len": builder.total_len_count(),
         "case_terms": builder.case_terms(),
@@ -113,7 +109,7 @@ def _build_index_parallel(corpus_path: str, index_dir: str) -> bool:
     serial path. Must produce byte-identical output to the serial build —
     see the extensive comments in _spimi_cpp.cpp's finalize_parallel."""
     import multiprocessing as mp
-    from submission._spimi_cpp import SpimiBuilder, finalize_parallel  # noqa: F401
+    from submission._spimi_cpp import finalize_parallel
     from submission.indexer import _stem
 
     offsets = _doc_line_offsets(corpus_path)
@@ -133,7 +129,16 @@ def _build_index_parallel(corpus_path: str, index_dir: str) -> bool:
         size = base + (1 if i < rem else 0)
         worker_dir = os.path.join(index_dir, f"_w{i}")
         worker_dirs.append(worker_dir)
-        tasks.append((corpus_path, offsets[start_ord], size, start_ord, worker_dir, worker_flush))
+        tasks.append(
+            (
+                corpus_path,
+                offsets[start_ord],
+                size,
+                start_ord,
+                worker_dir,
+                worker_flush,
+            )
+        )
         start_ord += size
 
     ctx = mp.get_context()
@@ -180,7 +185,7 @@ def build_index(corpus_path: str, index_dir: str) -> None:
     corpus = load_corpus(corpus_path)
 
     # C++ SPIMI: flushes sorted blocks past a threshold and merges them into
-    # save_v2's on-disk format, so peak memory stays bounded on large corpora.
+    # compact v2 on-disk format, so peak memory stays bounded on large corpora.
     # Tokenisation stays in Python (memoised nltk).
     try:
         from submission._spimi_cpp import SpimiBuilder
@@ -201,7 +206,7 @@ def build_index(corpus_path: str, index_dir: str) -> None:
     except ImportError:
         index = InvertedIndex()
         index.build(corpus)
-        index.save_v2(index_dir)  # JSON save() kept in indexer.py for reference
+        index.save_v2(index_dir)
 
 
 def load_index(index_dir: str) -> None:
@@ -213,7 +218,6 @@ def load_index(index_dir: str) -> None:
     # loops. Falls back to InvertedIndex + bm25/boolean_vsm if unbuilt.
     try:
         import submission._index_cpp  # noqa: F401  (presence check)
-        import json
         from submission import indexer
 
         with open(f"{index_dir}/meta.json") as f:

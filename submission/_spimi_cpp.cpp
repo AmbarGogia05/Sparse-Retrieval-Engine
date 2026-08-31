@@ -3,9 +3,10 @@
 // Single-pass in-memory indexing with block flushing: accumulate postings in
 // memory and, when the posting count crosses a threshold, flush a sorted
 // block to a temp file. finalize() k-way merges the blocks, applies the
-// truecase df-ratio gate, and writes the SAME compressed on-disk format as
-// InvertedIndex.save_v2 (docs.txt / terms.txt / postings.bin / meta.json) so
-// NativeIndex / load_v2 read it unchanged.
+// truecase df-ratio gate, and writes the compact v2 format consumed by
+// NativeIndex and the Python fallback: terms.txt, postings.bin, doclen.bin,
+// meta.json, and the optional docids.bin, tf1.bin, early.bin, and
+// case_terms.bin sidecars.
 //
 // Purpose is OOM-safety on large corpora: peak memory is one block plus the
 // streaming merge, never the whole postings set. Tokenisation is fused in via
@@ -42,6 +43,12 @@ static const std::string EARLY_PREFIX = "\x01" "early:";
 
 static bool is_early_term(const std::string &term) {
     return term.compare(0, EARLY_PREFIX.size(), EARLY_PREFIX) == 0;
+}
+
+static bool has_upper(const std::string &text) {
+    return std::any_of(text.begin(), text.end(), [](char c) {
+        return c >= 'A' && c <= 'Z';
+    });
 }
 
 static void put_vbyte(std::string &out, long n) {
@@ -134,51 +141,17 @@ static void put_case_terms(std::string &out,
     }
 }
 
-// Read one VByte from a byte buffer, advancing pos (mirror of put_vbyte).
-static long get_vbyte(const unsigned char *p, size_t &pos) {
-    long n = 0;
-    int s = 0;
-    unsigned char b;
-    do {
-        b = p[pos++];
-        n |= static_cast<long>(b & 0x7F) << s;
-        s += 7;
-    } while (!(b & 0x80));
-    return n;
-}
-
 template <typename T>
 static void wr(std::ofstream &f, T v) { f.write(reinterpret_cast<const char *>(&v), sizeof(T)); }
 template <typename T>
 static T rd(std::ifstream &f) { T v; f.read(reinterpret_cast<char *>(&v), sizeof(T)); return v; }
 
-// --- A1 codec: fold "tf == 1" into the gap ---------------------------------
-// A posting list (ascending absolute ords, parallel tfs) is written as: df
-// codes (one per posting, `gap*2 + (tf>1 ? 1 : 0)`), followed by ONLY the
-// tfs for postings whose flag bit is set (tf==1 postings emit no tf byte at
-// all — 73.7% of postings in this corpus, so this is the bulk of the size
-// win). Shared by postings.bin (per-term, ords = doc ordinals) and
-// forward.bin (per-doc, ords = term ordinals) — same shape of problem, same
-// codec, same gap-then-conditional-tfs layout as the pre-A1 format so the
-// change is a pure re-encoding.
-static void put_postings(std::string &out, const std::vector<uint32_t> &ords,
-                          const std::vector<uint32_t> &tfs) {
-    uint32_t prev = 0;
-    for (size_t i = 0; i < ords.size(); i++) {
-        uint32_t gap = (i == 0) ? ords[i] : ords[i] - prev;
-        prev = ords[i];
-        uint32_t code = (gap << 1) | (tfs[i] > 1 ? 1u : 0u);
-        put_vbyte(out, static_cast<long>(code));
-    }
-    for (size_t i = 0; i < ords.size(); i++)
-        if (tfs[i] > 1) put_vbyte(out, static_cast<long>(tfs[i]));
-}
-
-// Elias-Fano encoder for the FINAL postings.bin (the intermediate SPIMI block
-// files keep the simpler put_postings/BlockReader codec above). One posting
+// Elias-Fano encoder for the final postings.bin. One posting
 // list of m = ords.size() ascending doc ordinals in [0,N): l = floor(log2(N/m))
 // low bits/value packed LSB-first byte-padded; a unary high stream ((hi-prev)
-// zeros then a 1) byte-padded; then (tf-1) in 128-blocks (width byte + packed).
+// zeros then a 1) byte-padded; then, unless all_tf_one is true, (tf-1) in
+// 128-blocks (width byte + packed). tf1.bin records which terms omit that
+// final section.
 // Must stay byte-identical to indexer._encode_postings and _index_cpp
 // NativeIndex::get_postings (which recomputes l from m,N and decodes this).
 static void put_postings_ef(std::string &out, const std::vector<uint32_t> &ords,
@@ -291,9 +264,8 @@ static void put_monotone_ef(std::string &out, const std::vector<uint32_t> &vals,
 //   for each present term: VByte(early_df), EF(posting positions, universe=df)
 //
 // Encoding positions within the ordinary posting list avoids repeating doc
-// ordinals. Only ~12% of postings are early on the full corpus, so this is
-// materially smaller than one bit per posting and lets the reader retain only
-// the matching doc ordinals in memory.
+// ordinals. The sparse representation is smaller than a full aligned flag
+// stream and lets the reader retain only matching doc ordinals in memory.
 template <typename PerTerm>
 static std::string encode_early_sparse(const std::vector<PerTerm> &data) {
     std::string out("SEF1", 4);
@@ -313,51 +285,6 @@ static std::string encode_early_sparse(const std::vector<PerTerm> &data) {
         for (size_t i = 0; i < flags.size(); i++)
             if (flags[i]) positions.push_back(static_cast<uint32_t>(i));
         put_monotone_ef(out, positions, static_cast<long>(flags.size()));
-    }
-    return out;
-}
-
-// Decode one worker's forward.tmp (local-id gaps + tfs per doc, written by
-// SpimiBuilder::add_document) and re-encode it with local ids remapped to
-// final (global) term ordinals via local_to_final, dropping pruned terms
-// (local_to_final[id] == -1) and re-sorting each doc's terms by final
-// ordinal. Shared by SpimiBuilder::write_forward (serial path) and
-// finalize_parallel (parallel path) so both produce byte-identical output
-// for the same (forward.tmp, n_docs, local_to_final) input.
-static std::string encode_forward_bytes(const std::string &forward_tmp_path, uint32_t n_docs,
-                                         const std::vector<int> &local_to_final) {
-    std::ifstream f(forward_tmp_path, std::ios::binary);
-    std::string buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    f.close();
-    const unsigned char *p = reinterpret_cast<const unsigned char *>(buf.data());
-    size_t pos = 0;
-    std::string out;
-    for (uint32_t d = 0; d < n_docs; d++) {
-        long n = get_vbyte(p, pos);
-        std::vector<uint32_t> locs(n);
-        std::vector<uint32_t> tfs(n);
-        long prev = 0;
-        for (long i = 0; i < n; i++) {
-            long g = get_vbyte(p, pos);
-            prev = (i == 0) ? g : prev + g;
-            locs[i] = static_cast<uint32_t>(prev);
-        }
-        for (long i = 0; i < n; i++) tfs[i] = static_cast<uint32_t>(get_vbyte(p, pos));
-
-        std::vector<std::pair<int, uint32_t>> keep;  // (final ord, tf)
-        keep.reserve(n);
-        for (long i = 0; i < n; i++) {
-            int fo = local_to_final[locs[i]];
-            if (fo >= 0) keep.push_back({fo, tfs[i]});
-        }
-        std::sort(keep.begin(), keep.end());
-
-        put_vbyte(out, static_cast<long>(keep.size()));
-        std::vector<uint32_t> kord, ktf;
-        kord.reserve(keep.size());
-        ktf.reserve(keep.size());
-        for (auto &kv : keep) { kord.push_back(static_cast<uint32_t>(kv.first)); ktf.push_back(kv.second); }
-        put_postings(out, kord, ktf);
     }
     return out;
 }
@@ -390,6 +317,164 @@ struct BlockReader {
     }
 };
 
+struct TermPostings {
+    std::vector<uint32_t> ords, tfs;
+    std::vector<uint8_t> early;
+};
+
+struct SelectedTerms {
+    std::vector<std::string> kept;
+    std::unordered_set<std::string> pruned;
+    std::unordered_set<std::string> case_sensitive;
+};
+
+static std::map<std::string, uint32_t>
+scan_document_frequencies(const std::vector<std::string> &block_files) {
+    std::map<std::string, uint32_t> frequencies;
+    for (const auto &path : block_files) {
+        std::ifstream file(path, std::ios::binary);
+        uint32_t term_length;
+        while (file.read(reinterpret_cast<char *>(&term_length),
+                         sizeof(term_length))) {
+            std::string term(term_length, '\0');
+            file.read(&term[0], term_length);
+            uint32_t df = rd<uint32_t>(file);
+            frequencies[term] += df;
+            file.seekg(static_cast<std::streamoff>(df) *
+                           (2 * sizeof(uint32_t) + sizeof(uint8_t)),
+                       std::ios::cur);
+        }
+    }
+    return frequencies;
+}
+
+static SelectedTerms select_terms(
+    const std::map<std::string, uint32_t> &frequencies,
+    const std::unordered_map<std::string, std::string> &canonical,
+    double df_ratio) {
+    SelectedTerms selected;
+    selected.kept.reserve(frequencies.size());
+
+    for (const auto &entry : frequencies) {
+        const std::string &term = entry.first;
+        bool keep = true;
+        if (has_upper(term)) {
+            uint32_t canonical_df = 0;
+            auto canonical_it = canonical.find(term);
+            if (canonical_it != canonical.end()) {
+                auto frequency_it = frequencies.find(canonical_it->second);
+                if (frequency_it != frequencies.end())
+                    canonical_df = frequency_it->second;
+            }
+            keep = canonical_df == 0 ||
+                   static_cast<double>(entry.second) / canonical_df <= df_ratio;
+            if (keep)
+                selected.case_sensitive.insert(term);
+            else
+                selected.pruned.insert(term);
+        }
+        if (keep) selected.kept.push_back(term);
+    }
+    return selected;
+}
+
+static std::vector<TermPostings> merge_blocks(
+    const std::vector<std::string> &block_files,
+    const std::vector<std::string> &kept_terms,
+    const std::unordered_set<std::string> &pruned) {
+    std::unordered_map<std::string, size_t> term_slot;
+    term_slot.reserve(kept_terms.size() * 2);
+    for (size_t i = 0; i < kept_terms.size(); i++)
+        term_slot[kept_terms[i]] = i;
+
+    std::vector<BlockReader> readers;
+    readers.reserve(block_files.size());
+    for (const auto &path : block_files) readers.emplace_back(path);
+
+    std::vector<TermPostings> data(kept_terms.size());
+    while (true) {
+        std::string next_term;
+        bool found = false;
+        for (const auto &reader : readers) {
+            if (reader.ok && (!found || reader.term < next_term)) {
+                next_term = reader.term;
+                found = true;
+            }
+        }
+        if (!found) break;
+
+        std::vector<uint32_t> ords, tfs;
+        std::vector<uint8_t> early;
+        for (auto &reader : readers) {
+            if (!reader.ok || reader.term != next_term) continue;
+            ords.insert(ords.end(), reader.ords.begin(), reader.ords.end());
+            tfs.insert(tfs.end(), reader.tfs.begin(), reader.tfs.end());
+            early.insert(early.end(), reader.early.begin(), reader.early.end());
+            reader.advance();
+        }
+        if (pruned.count(next_term)) continue;
+
+        TermPostings &postings = data[term_slot.at(next_term)];
+        postings.ords = std::move(ords);
+        postings.tfs = std::move(tfs);
+        postings.early = std::move(early);
+    }
+    return data;
+}
+
+static void write_index(
+    const std::string &dir,
+    const std::vector<std::string> &terms,
+    const std::vector<TermPostings> &data,
+    const std::unordered_set<std::string> &case_terms,
+    uint32_t document_count,
+    long total_document_length) {
+    std::string terms_blob;
+    std::string postings_blob;
+    std::string tf_one("TF1", 3);
+    tf_one.resize(3 + (terms.size() + 7) / 8, '\0');
+
+    std::string previous_term;
+    for (size_t i = 0; i < terms.size(); i++) {
+        put_term_frontcoded(terms_blob, previous_term, terms[i],
+                            static_cast<long>(data[i].ords.size()));
+        bool all_one = std::all_of(
+            data[i].tfs.begin(), data[i].tfs.end(),
+            [](uint32_t tf) { return tf == 1; });
+        if (all_one)
+            tf_one[3 + i / 8] = static_cast<char>(
+                static_cast<unsigned char>(tf_one[3 + i / 8]) |
+                static_cast<unsigned char>(1u << (i % 8)));
+        put_postings_ef(postings_blob, data[i].ords, data[i].tfs,
+                        static_cast<long>(document_count), all_one);
+    }
+
+    std::string early_blob = encode_early_sparse(data);
+    std::ofstream(dir + "/terms.txt", std::ios::binary)
+        .write(terms_blob.data(), terms_blob.size());
+    std::ofstream(dir + "/postings.bin", std::ios::binary)
+        .write(postings_blob.data(), postings_blob.size());
+    std::ofstream(dir + "/tf1.bin", std::ios::binary)
+        .write(tf_one.data(), tf_one.size());
+    std::ofstream(dir + "/early.bin", std::ios::binary)
+        .write(early_blob.data(), early_blob.size());
+
+    std::string case_blob;
+    put_case_terms(case_blob, case_terms);
+    std::ofstream(dir + "/case_terms.bin", std::ios::binary)
+        .write(case_blob.data(), case_blob.size());
+
+    double average_length = document_count
+        ? static_cast<double>(total_document_length) / document_count
+        : 0.0;
+    std::ofstream meta(dir + "/meta.json");
+    meta << std::setprecision(std::numeric_limits<double>::max_digits10);
+    meta << "{\"N\": " << document_count
+         << ", \"avg_doc_len\": " << average_length << "}";
+    meta.close();
+    compact_docids(dir);
+}
+
 struct SpimiBuilder {
     std::string dir;
     size_t flush_threshold;
@@ -401,22 +486,11 @@ struct SpimiBuilder {
     long total_len = 0;
     std::vector<std::string> block_files;
     std::ofstream docs_out;
-    // A4: doc lengths move out of docs.txt (which now holds ONLY verbatim
-    // doc-id lines) into their own VByte stream, written in lockstep with
-    // docs_out so row i of docs.txt and the i-th VByte in doclen_out always
-    // refer to the same doc.
+    // During the build, temporary doc-ID lines and the parallel VByte
+    // doclen.bin stream are written in lockstep. Finalization may replace
+    // docs.txt with the compact docids.bin representation.
     std::ofstream doclen_out;
     std::unordered_set<std::string> case_terms_seen;
-
-    // Forward index (doc -> its terms+tfs), needed to build RM3 relevance
-    // models at query time. Term ordinals aren't known until the final merge
-    // fixes the vocabulary order, so during streaming we write each doc's
-    // vector keyed by a stable *local* id, then remap local -> final ord in a
-    // single pass in finalize(). `vocab` (string -> local id) is bounded by
-    // vocabulary size (~10^5), not by the postings, so it doesn't threaten the
-    // OOM-safety the block flushing provides.
-    std::unordered_map<std::string, uint32_t> vocab;
-    std::ofstream fwd_tmp;
 
     // Fused tokenizer (owns the stopword set + stem cache for this worker) and a
     // reusable token buffer, so add_document_from_text allocates no Python list.
@@ -426,22 +500,7 @@ struct SpimiBuilder {
 
     SpimiBuilder(const std::string &d, size_t threshold, uint32_t start_ord = 0)
         : dir(d), flush_threshold(threshold), n_docs(start_ord), docs_out(d + "/docs.txt"),
-          doclen_out(d + "/doclen.bin", std::ios::binary),
-          fwd_tmp(d + "/forward.tmp", std::ios::binary) {}
-
-    uint32_t local_id(const std::string &t) {
-        auto it = vocab.find(t);
-        if (it != vocab.end()) return it->second;
-        uint32_t id = static_cast<uint32_t>(vocab.size());
-        vocab.emplace(t, id);
-        return id;
-    }
-
-    static bool has_upper(const std::string &s) {
-        for (char c : s)
-            if (c >= 'A' && c <= 'Z') return true;
-        return false;
-    }
+          doclen_out(d + "/doclen.bin", std::ios::binary) {}
 
     void add_document(const std::string &doc_id, const std::vector<std::string> &tokens, int doc_len) {
         docs_out << doc_id << '\n';
@@ -462,29 +521,15 @@ struct SpimiBuilder {
                 continue;
             }
             tf[t]++;
-            if (has_upper(t)) case_terms_seen.insert(t);
+            if (::has_upper(t)) case_terms_seen.insert(t);
         }
-        std::vector<std::pair<uint32_t, uint32_t>> fwd;  // (local id, tf)
-        fwd.reserve(tf.size());
         for (auto &kv : tf) {
             auto &vec = block[kv.first];
             vec.push_back({ord, kv.second});
             block_early[kv.first].push_back(
                 static_cast<uint8_t>(early_terms.count(kv.first) != 0));
             cur_postings++;
-            fwd.push_back({local_id(kv.first), kv.second});
         }
-        // Append this doc's forward vector (local-id gaps + tfs) to forward.tmp.
-        std::sort(fwd.begin(), fwd.end());
-        std::string rec;
-        put_vbyte(rec, static_cast<long>(fwd.size()));
-        uint32_t prev = 0;
-        for (size_t i = 0; i < fwd.size(); i++) {
-            put_vbyte(rec, i == 0 ? fwd[i].first : fwd[i].first - prev);
-            prev = fwd[i].first;
-        }
-        for (auto &p : fwd) put_vbyte(rec, p.second);
-        fwd_tmp.write(rec.data(), rec.size());
 
         if (cur_postings >= flush_threshold) flush_block();
     }
@@ -499,10 +544,11 @@ struct SpimiBuilder {
     // add_document(doc_id, tokenize_doc(text)...).
     void add_document_from_text(const std::string &doc_id, const std::string &text) {
         int doc_len = tok.tokenize(text, tok_buf);
-        // Match the experiment: tokenize the first 12 whitespace-delimited
-        // raw words with the same tokenizer. Internal marker tokens let
-        // add_document() set one bit on the corresponding ordinary posting;
-        // the markers themselves never enter the persisted vocabulary.
+        // Tokenize the first 12 whitespace-delimited raw words with the same
+        // tokenizer. Internal marker tokens let add_document() set a
+        // transient early-prefix flag; the markers never enter the persisted
+        // vocabulary. finalize() writes the surviving flags sparsely to
+        // early.bin.
         std::string prefix;
         size_t pos = 0;
         int words = 0;
@@ -558,7 +604,7 @@ struct SpimiBuilder {
     // Used when a SpimiBuilder is one of N per-worker builders (each owning
     // a contiguous, globally-ordinalled slice of the corpus) instead of the
     // sole builder for the whole corpus. close_worker() flushes the last
-    // in-memory block and closes this worker's docs.txt/forward.tmp files
+    // in-memory block and closes this worker's document sidecars
     // without doing any cross-worker merge work; the parent process then
     // hands the accessors below to finalize_parallel() to do the k-way
     // merge (see finalize_parallel below for how ord/df-hash-order identity
@@ -567,181 +613,27 @@ struct SpimiBuilder {
         flush_block();
         docs_out.close();
         doclen_out.close();
-        fwd_tmp.close();
     }
 
     std::vector<std::string> get_block_files() const { return block_files; }
-    std::unordered_map<std::string, uint32_t> get_vocab() const { return vocab; }
-    // NOTE: get_n_docs() (below) is the running *global ordinal* counter
-    // (n_docs == start_ord + docs added so far); get_local_docs() is the
-    // count of add_document() calls on this instance. They coincide when
-    // start_ord == 0 (the serial-path / single-builder case), but differ
-    // for a parallel worker with a nonzero start_ord — using the wrong one
-    // for the forward-index row count or the cross-worker N summation is
-    // an out-of-bounds read (this bit me once during development).
-    uint32_t get_n_docs() const { return n_docs; }
     uint32_t get_local_docs() const { return local_docs; }
     long get_total_len() const { return total_len; }
     std::string docs_path() const { return dir + "/docs.txt"; }
     std::string doclen_path() const { return dir + "/doclen.bin"; }
-    std::string forward_tmp_path() const { return dir + "/forward.tmp"; }
-
-    // Second pass over forward.tmp: remap local ids -> final term ordinals,
-    // drop pruned terms, re-sort each doc's terms by final ordinal, and write
-    // the compressed forward.bin (per doc: VByte count, then final-ordinal
-    // gaps, then tfs). Doc order matches docs.txt (streamed in add order).
-    void write_forward(const std::vector<int> &local_to_final) {
-        std::string out = encode_forward_bytes(dir + "/forward.tmp", n_docs, local_to_final);
-        std::ofstream(dir + "/forward.bin", std::ios::binary).write(out.data(), out.size());
-    }
 
     void finalize(const std::unordered_map<std::string, std::string> &canonical, double df_ratio) {
         flush_block();
         docs_out.close();
         doclen_out.close();
-        fwd_tmp.close();
 
-        // Pass 1: global df per term (header scan, skipping postings bytes).
-        std::unordered_map<std::string, uint32_t> df_all;
-        for (auto &path : block_files) {
-            std::ifstream f(path, std::ios::binary);
-            uint32_t tl;
-            while (f.read(reinterpret_cast<char *>(&tl), sizeof(tl))) {
-                std::string term(tl, '\0');
-                f.read(&term[0], tl);
-                uint32_t df = rd<uint32_t>(f);
-                df_all[term] += df;
-                f.seekg(static_cast<std::streamoff>(df) *
-                        (2 * sizeof(uint32_t) + sizeof(uint8_t)),
-                        std::ios::cur);
-            }
-        }
-
-        // Truecase gate: keep a case term only if df(case)/df(canonical) <= ratio.
-        std::unordered_set<std::string> prune, keep_case;
-        for (auto &kv : df_all) {
-            const std::string &term = kv.first;
-            if (!has_upper(term)) continue;
-            auto ci = canonical.find(term);
-            uint32_t cdf = 0;
-            if (ci != canonical.end()) {
-                auto di = df_all.find(ci->second);
-                if (di != df_all.end()) cdf = di->second;
-            }
-            if (cdf == 0 || static_cast<double>(kv.second) / cdf <= df_ratio)
-                keep_case.insert(term);
-            else
-                prune.insert(term);
-        }
-
-        // Final term ordinals are assigned ALPHABETICALLY (== the order the
-        // k-way merge below visits terms, and what NativeIndex assigns as ids).
-        // The old A2 df-descending order existed only to shrink forward.bin's
-        // gaps; forward.bin is gone, so alphabetical is free and lets terms.txt
-        // be front-coded. Pruned terms never get an ordinal.
-        std::vector<std::string> kept_terms;
-        kept_terms.reserve(df_all.size());
-        for (auto &kv : df_all)
-            if (!prune.count(kv.first)) kept_terms.push_back(kv.first);
-        std::sort(kept_terms.begin(), kept_terms.end());
-        std::unordered_map<std::string, int> final_ord_map;
-        final_ord_map.reserve(kept_terms.size() * 2);
-        for (size_t i = 0; i < kept_terms.size(); i++) final_ord_map[kept_terms[i]] = static_cast<int>(i);
-
-        // Pass 2: k-way merge by term (alphabetical, cheap with BlockReader),
-        // buffering each surviving term's postings at its FINAL (df-order)
-        // slot so they can be written out in final-ordinal order afterward.
-        std::vector<BlockReader *> readers;
-        for (auto &path : block_files) readers.push_back(new BlockReader(path));
-
-        struct PerTerm {
-            std::vector<uint32_t> ords, tfs;
-            std::vector<uint8_t> early;
-        };
-        std::vector<PerTerm> data(kept_terms.size());
-
-        // Map each surviving term's local id -> its final ordinal (position in
-        // terms.txt). Pruned / never-emitted terms keep -1 so the forward-index
-        // remap drops them. NativeIndex assigns term ids in terms.txt order, so
-        // "final ordinal" == the id RM3 will look terms up by.
-        std::vector<int> local_to_final(vocab.size(), -1);
-
-        while (true) {
-            // smallest current term across readers
-            std::string mterm;
-            bool found = false;
-            for (auto *r : readers)
-                if (r->ok && (!found || r->term < mterm)) { mterm = r->term; found = true; }
-            if (!found) break;
-
-            // gather postings for mterm from all readers (block order => ascending ords)
-            std::vector<uint32_t> ords, tfs;
-            std::vector<uint8_t> early;
-            for (auto *r : readers) {
-                if (r->ok && r->term == mterm) {
-                    ords.insert(ords.end(), r->ords.begin(), r->ords.end());
-                    tfs.insert(tfs.end(), r->tfs.begin(), r->tfs.end());
-                    early.insert(early.end(), r->early.begin(), r->early.end());
-                    r->advance();
-                }
-            }
-            if (prune.count(mterm)) continue;
-
-            int fo = final_ord_map[mterm];
-            auto vi = vocab.find(mterm);
-            if (vi != vocab.end()) local_to_final[vi->second] = fo;
-            data[fo].ords = std::move(ords);
-            data[fo].tfs = std::move(tfs);
-            data[fo].early = std::move(early);
-        }
-        for (auto *r : readers) delete r;
-
-        std::string terms_blob;   // front-coded, buffered, written once
-        std::string postings;      // buffered, written once
-        std::string tf_one("TF1", 3);
-        tf_one.resize(3 + (kept_terms.size() + 7) / 8, '\0');
-        std::string prev_term;
-        for (size_t i = 0; i < kept_terms.size(); i++) {
-            put_term_frontcoded(terms_blob, prev_term, kept_terms[i],
-                                static_cast<long>(data[i].ords.size()));
-            bool all_one = std::all_of(data[i].tfs.begin(), data[i].tfs.end(),
-                                       [](uint32_t tf) { return tf == 1; });
-            if (all_one)
-                tf_one[3 + i / 8] = static_cast<char>(
-                    static_cast<unsigned char>(tf_one[3 + i / 8]) |
-                    static_cast<unsigned char>(1u << (i % 8)));
-            put_postings_ef(postings, data[i].ords, data[i].tfs,
-                            static_cast<long>(n_docs), all_one);
-        }
-        std::string early_sparse = encode_early_sparse(data);
-        std::ofstream(dir + "/terms.txt", std::ios::binary).write(terms_blob.data(), terms_blob.size());
-        std::ofstream(dir + "/postings.bin", std::ios::binary).write(postings.data(), postings.size());
-        std::ofstream(dir + "/tf1.bin", std::ios::binary)
-            .write(tf_one.data(), tf_one.size());
-        std::ofstream(dir + "/early.bin", std::ios::binary)
-            .write(early_sparse.data(), early_sparse.size());
-
-        // forward.bin is intentionally NOT written: it is a byte-for-byte
-        // redundant transpose of postings.bin, and NativeIndex reconstructs the
-        // forward index in RAM at load time (see _index_cpp.cpp load()). This
-        // roughly halves the persisted index size. write_forward()/
-        // encode_forward_bytes() are kept for reference but no longer called.
-
-        std::string case_blob;
-        put_case_terms(case_blob, keep_case);
-        std::ofstream(dir + "/case_terms.bin", std::ios::binary)
-            .write(case_blob.data(), case_blob.size());
-
-        // meta.json (N, avg_doc_len) — case terms are front-coded separately.
-        double avg = n_docs ? static_cast<double>(total_len) / n_docs : 0.0;
-        std::ofstream meta(dir + "/meta.json");
-        meta << std::setprecision(std::numeric_limits<double>::max_digits10);
-        meta << "{\"N\": " << n_docs << ", \"avg_doc_len\": " << avg << "}";
-        meta.close();
-        compact_docids(dir);
+        auto frequencies = scan_document_frequencies(block_files);
+        auto selected = select_terms(frequencies, canonical, df_ratio);
+        auto data = merge_blocks(
+            block_files, selected.kept, selected.pruned);
+        write_index(
+            dir, selected.kept, data, selected.case_sensitive, n_docs, total_len);
 
         for (auto &path : block_files) std::remove(path.c_str());
-        std::remove((dir + "/forward.tmp").c_str());
     }
 };
 
@@ -762,30 +654,18 @@ struct SpimiBuilder {
 //    k-way-merge `readers` list in [worker0's blocks..., worker1's
 //    blocks..., ...] order guarantees this — no ordinal remap needed.
 //
-// 2. df_all/keep_case (meta.json case_terms) insertion order: unordered_set
-//    iteration order depends on insertion order for keys that collide into
-//    the same hash bucket, so a naive "read blocks in worker order" Pass 1
-//    would build df_all with different bucket contents than the serial
-//    path and could emit case_terms in a different order — same set,
-//    different bytes. The serial path's single block (this corpus never
-//    triggers a mid-stream flush) is written by flush_block() in global
-//    alphabetical term order, so its Pass 1 inserts into df_all in that
-//    exact order. We replicate that here by first aggregating every
-//    worker's block headers into a std::map (alphabetically ordered by
-//    construction, regardless of read order) and then inserting into the
-//    unordered_map df_all in that alphabetical order — reproducing the
-//    same df_all bucket layout, hence the same downstream keep_case
-//    insertion order and the same case_terms byte output as the serial
-//    build.
+// 2. Document frequencies and truecase handling use the same shared helpers
+//    as serial finalization, so both paths apply identical filtering.
+//    put_case_terms() sorts the retained case-sensitive terms before
+//    writing case_terms.bin, so unordered_set iteration order no
+//    longer affects the serialized bytes.
 void finalize_parallel(const py::list &workers, const std::string &out_dir,
                         const std::unordered_map<std::string, std::string> &canonical,
                         double df_ratio) {
     struct WorkerData {
         std::vector<std::string> block_files;
-        std::unordered_map<std::string, uint32_t> vocab;
         std::string docs_txt;
         std::string doclen_bin;
-        std::string forward_tmp;
         uint32_t n_docs;  // LOCAL doc count for this worker (not a global
                            // ordinal) — see SpimiBuilder::get_local_docs.
         long total_len;
@@ -796,10 +676,8 @@ void finalize_parallel(const py::list &workers, const std::string &out_dir,
         py::dict d = item.cast<py::dict>();
         WorkerData w;
         w.block_files = d["block_files"].cast<std::vector<std::string>>();
-        w.vocab = d["vocab"].cast<std::unordered_map<std::string, uint32_t>>();
         w.docs_txt = d["docs_txt"].cast<std::string>();
         w.doclen_bin = d["doclen_bin"].cast<std::string>();
-        w.forward_tmp = d["forward_tmp"].cast<std::string>();
         w.n_docs = d["n_docs"].cast<uint32_t>();
         w.total_len = d["total_len"].cast<long>();
         ws.push_back(std::move(w));
@@ -831,157 +709,21 @@ void finalize_parallel(const py::list &workers, const std::string &out_dir,
     for (auto &w : ws)
         for (auto &p : w.block_files) all_blocks.push_back(p);
 
-    // Pass 1a: aggregate df per term into a *sorted* map first (order of
-    // reads doesn't matter, std::map is always alphabetical), then...
-    std::map<std::string, uint32_t> tmp_df;
-    for (auto &path : all_blocks) {
-        std::ifstream f(path, std::ios::binary);
-        uint32_t tl;
-        while (f.read(reinterpret_cast<char *>(&tl), sizeof(tl))) {
-            std::string term(tl, '\0');
-            f.read(&term[0], tl);
-            uint32_t df = rd<uint32_t>(f);
-            tmp_df[term] += df;
-            f.seekg(static_cast<std::streamoff>(df) *
-                    (2 * sizeof(uint32_t) + sizeof(uint8_t)),
-                    std::ios::cur);
-        }
-    }
-    // ...Pass 1b: insert into the unordered_map in that alphabetical order,
-    // matching the serial path's single-sorted-block Pass 1 exactly.
-    std::unordered_map<std::string, uint32_t> df_all;
-    for (auto &kv : tmp_df) df_all[kv.first] = kv.second;
-
-    // Truecase gate (identical logic/order to SpimiBuilder::finalize).
-    std::unordered_set<std::string> prune, keep_case;
-    for (auto &kv : df_all) {
-        const std::string &term = kv.first;
-        if (!SpimiBuilder::has_upper(term)) continue;
-        auto ci = canonical.find(term);
-        uint32_t cdf = 0;
-        if (ci != canonical.end()) {
-            auto di = df_all.find(ci->second);
-            if (di != df_all.end()) cdf = di->second;
-        }
-        if (cdf == 0 || static_cast<double>(kv.second) / cdf <= df_ratio)
-            keep_case.insert(term);
-        else
-            prune.insert(term);
-    }
-
-    // Alphabetical term order (same as the serial path): == the merge order and
-    // the ids NativeIndex assigns, and what front-coded terms.txt requires. The
-    // old A2 df-order only helped the now-removed forward.bin.
-    std::vector<std::string> kept_terms;
-    kept_terms.reserve(df_all.size());
-    for (auto &kv : df_all)
-        if (!prune.count(kv.first)) kept_terms.push_back(kv.first);
-    std::sort(kept_terms.begin(), kept_terms.end());
-    std::unordered_map<std::string, int> final_ord_map;
-    final_ord_map.reserve(kept_terms.size() * 2);
-    for (size_t i = 0; i < kept_terms.size(); i++) final_ord_map[kept_terms[i]] = static_cast<int>(i);
-
-    // Pass 2: k-way merge, readers ordered [worker0 blocks..., worker1
-    // blocks..., ...] so per-term postings concatenate in ascending
-    // (global) ordinal order without any remap. Buffer each surviving
-    // term's postings at its final (df-order) slot, same as the serial path.
-    std::vector<BlockReader *> readers;
-    for (auto &w : ws)
-        for (auto &p : w.block_files) readers.push_back(new BlockReader(p));
-
-    struct PerTerm {
-        std::vector<uint32_t> ords, tfs;
-        std::vector<uint8_t> early;
-    };
-    std::vector<PerTerm> data(kept_terms.size());
-
-    std::vector<std::vector<int>> local_to_final(ws.size());
-    for (size_t i = 0; i < ws.size(); i++) local_to_final[i].assign(ws[i].vocab.size(), -1);
-
-    while (true) {
-        std::string mterm;
-        bool found = false;
-        for (auto *r : readers)
-            if (r->ok && (!found || r->term < mterm)) { mterm = r->term; found = true; }
-        if (!found) break;
-
-        std::vector<uint32_t> ords, tfs;
-        std::vector<uint8_t> early;
-        for (auto *r : readers) {
-            if (r->ok && r->term == mterm) {
-                ords.insert(ords.end(), r->ords.begin(), r->ords.end());
-                tfs.insert(tfs.end(), r->tfs.begin(), r->tfs.end());
-                early.insert(early.end(), r->early.begin(), r->early.end());
-                r->advance();
-            }
-        }
-        if (prune.count(mterm)) continue;
-
-        int fo = final_ord_map[mterm];
-        for (size_t wi = 0; wi < ws.size(); wi++) {
-            auto it = ws[wi].vocab.find(mterm);
-            if (it != ws[wi].vocab.end()) local_to_final[wi][it->second] = fo;
-        }
-        data[fo].ords = std::move(ords);
-        data[fo].tfs = std::move(tfs);
-        data[fo].early = std::move(early);
-    }
-    for (auto *r : readers) delete r;
-
-    std::string terms_blob;   // front-coded, buffered, written once
-    std::string postings;
-    std::string tf_one("TF1", 3);
-    tf_one.resize(3 + (kept_terms.size() + 7) / 8, '\0');
-    std::string prev_term;
-    for (size_t i = 0; i < kept_terms.size(); i++) {
-        put_term_frontcoded(terms_blob, prev_term, kept_terms[i],
-                            static_cast<long>(data[i].ords.size()));
-        bool all_one = std::all_of(data[i].tfs.begin(), data[i].tfs.end(),
-                                   [](uint32_t tf) { return tf == 1; });
-        if (all_one)
-            tf_one[3 + i / 8] = static_cast<char>(
-                static_cast<unsigned char>(tf_one[3 + i / 8]) |
-                static_cast<unsigned char>(1u << (i % 8)));
-        put_postings_ef(postings, data[i].ords, data[i].tfs,
-                        static_cast<long>(N), all_one);
-    }
-    std::string early_sparse = encode_early_sparse(data);
-    std::ofstream(out_dir + "/terms.txt", std::ios::binary).write(terms_blob.data(), terms_blob.size());
-    std::ofstream(out_dir + "/postings.bin", std::ios::binary).write(postings.data(), postings.size());
-    std::ofstream(out_dir + "/tf1.bin", std::ios::binary)
-        .write(tf_one.data(), tf_one.size());
-    std::ofstream(out_dir + "/early.bin", std::ios::binary)
-        .write(early_sparse.data(), early_sparse.size());
-
-    // forward.bin is intentionally NOT written here (nor in the serial path):
-    // it is a redundant transpose of postings.bin and is reconstructed in RAM
-    // at load time by NativeIndex (see _index_cpp.cpp load()). The per-worker
-    // forward.tmp scratch is still produced and removed below; only the final
-    // persisted forward.bin is dropped.
-
-    std::string case_blob;
-    put_case_terms(case_blob, keep_case);
-    std::ofstream(out_dir + "/case_terms.bin", std::ios::binary)
-        .write(case_blob.data(), case_blob.size());
-
-    // meta.json — identical format/logic to SpimiBuilder::finalize.
-    double avg = N ? static_cast<double>(total_len) / N : 0.0;
-    std::ofstream meta(out_dir + "/meta.json");
-    meta << std::setprecision(std::numeric_limits<double>::max_digits10);
-    meta << "{\"N\": " << N << ", \"avg_doc_len\": " << avg << "}";
-    meta.close();
-    compact_docids(out_dir);
+    auto frequencies = scan_document_frequencies(all_blocks);
+    auto selected = select_terms(frequencies, canonical, df_ratio);
+    auto data = merge_blocks(all_blocks, selected.kept, selected.pruned);
+    write_index(
+        out_dir, selected.kept, data, selected.case_sensitive, N, total_len);
 
     for (auto &path : all_blocks) std::remove(path.c_str());
     for (auto &w : ws) {
-        std::remove(w.forward_tmp.c_str());
-        std::remove(w.docs_txt.c_str());    // already concatenated into out_dir/docs.txt above
-        std::remove(w.doclen_bin.c_str());  // already concatenated into out_dir/doclen.bin above
+        std::remove(w.docs_txt.c_str());    // copied into the final temp stream above
+        std::remove(w.doclen_bin.c_str());  // copied into the final temp stream above
     }
 }
 
 PYBIND11_MODULE(_spimi_cpp, m) {
-    m.doc() = "SPIMI index builder: block-flushing, writes save_v2's format.";
+    m.doc() = "SPIMI index builder: block flushing and compact v2 serialization.";
     py::class_<SpimiBuilder>(m, "SpimiBuilder")
         .def(py::init<const std::string &, size_t, uint32_t>(),
              py::arg("index_dir"), py::arg("flush_threshold"), py::arg("start_ord") = 0)
@@ -995,12 +737,10 @@ PYBIND11_MODULE(_spimi_cpp, m) {
         .def("finalize", &SpimiBuilder::finalize, py::arg("canonical"), py::arg("df_ratio"))
         .def("close_worker", &SpimiBuilder::close_worker)
         .def("block_files", &SpimiBuilder::get_block_files)
-        .def("vocab", &SpimiBuilder::get_vocab)
         .def("n_docs_count", &SpimiBuilder::get_local_docs)
         .def("total_len_count", &SpimiBuilder::get_total_len)
         .def("docs_path", &SpimiBuilder::docs_path)
-        .def("doclen_path", &SpimiBuilder::doclen_path)
-        .def("forward_tmp_path", &SpimiBuilder::forward_tmp_path);
+        .def("doclen_path", &SpimiBuilder::doclen_path);
     m.def("finalize_parallel", &finalize_parallel,
           py::arg("workers"), py::arg("out_dir"), py::arg("canonical"), py::arg("df_ratio"));
 }

@@ -29,29 +29,29 @@ parameters, not hard-coded — you need to sweep them for your report
 """
 
 import math
+from collections import defaultdict
 from typing import List, Tuple
+
 from submission.indexer import InvertedIndex, tokenize
+
+_INDEX = None
+_IDF = {}
 
 
 def build(index: InvertedIndex) -> None:
-    """Optional: precompute anything BM25-specific (e.g. cached IDF values
-    per term) from the InvertedIndex built in indexer.py.
+    """Prepare BM25 state for the pure-Python fallback scorer.
 
-    Call this from retrieve.load_index(), not retrieve.build_index() —
-    the harness runs those two in separate processes, so any cache this
-    creates only needs to exist in the process that also calls
-    retrieve(). If you want a precomputed cache to persist across the
-    build/load boundary too, write it out via InvertedIndex.save() instead
-    (it then counts toward your index-size score) and rebuild the cache
-    here from the loaded index."""
-    global _INDEX
+    The native path does not call this function; custom_scorer.build() invokes
+    it after loading the compact index when the native extension is absent.
+    """
+    global _INDEX, _IDF
     _INDEX = index
-    global idf_cache
-    idf_cache = {}
-    for token in _INDEX.postings:
-        idf_cache[token] = math.log(
-            (_INDEX.N - _INDEX.document_frequency(token) + 0.5)
-            / (_INDEX.document_frequency(token) + 0.5)
+    _IDF = {}
+    for term, postings in index.postings.items():
+        document_frequency = len(postings)
+        _IDF[term] = math.log(
+            (index.N - document_frequency + 0.5)
+            / (document_frequency + 0.5)
             + 1
         )
 
@@ -61,22 +61,20 @@ def score(
 ) -> List[Tuple[str, float]]:
     """Return up to k (doc_id, score) pairs for `query`, BM25-ranked,
     highest score first."""
-    query_tokens = tokenize(query)
-    scores = {}
-    for token in query_tokens:
-        if token not in _INDEX.postings:
+    scores = defaultdict(float)
+    for term in tokenize(query):
+        postings = _INDEX.postings.get(term)
+        if postings is None:
             continue
-        idf_token = idf_cache[token]
-        for doc_id in _INDEX.postings[token]:
-            tf_token_doc = _INDEX.postings[token][doc_id]
-            doc_len = _INDEX.doc_len[doc_id]
-            avg_doc_len = _INDEX.avg_doc_len
-            score_token_doc = (
-                idf_token
-                * (tf_token_doc * (k1 + 1))
-                / (tf_token_doc + k1 * (1 - b + b * doc_len / avg_doc_len))
+        for doc_id, term_frequency in postings.items():
+            length_ratio = _INDEX.doc_len[doc_id] / _INDEX.avg_doc_len
+            scores[doc_id] += (
+                _IDF[term]
+                * term_frequency
+                * (k1 + 1)
+                / (
+                    term_frequency
+                    + k1 * (1 - b + b * length_ratio)
+                )
             )
-            if doc_id not in scores:
-                scores[doc_id] = 0
-            scores[doc_id] += score_token_doc
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)[:k]

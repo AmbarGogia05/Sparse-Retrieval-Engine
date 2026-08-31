@@ -1,6 +1,6 @@
 // submission/tokenizer.cpp — definitions for tokenizer.h (shared by _stem_cpp
 // and _spimi_cpp). Byte-for-byte port of nltk EnglishStemmer.stem +
-// indexer.tokenize_v2. See tokenizer.h. Do NOT "clean up" the stemmer's
+// indexer._tokenize_python. See tokenizer.h. Do NOT "clean up" the stemmer's
 // three-parallel-string model or nltk's r2="e" quirks — fidelity to nltk is
 // what keeps the index byte-identical.
 

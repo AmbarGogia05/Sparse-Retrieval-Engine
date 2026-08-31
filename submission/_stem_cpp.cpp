@@ -22,13 +22,6 @@ Tokenizer g_tok;
 
 std::string stem(const std::string &word) { return Tokenizer::stem(word); }
 
-std::vector<std::string> stem_many(const std::vector<std::string> &words) {
-    std::vector<std::string> out;
-    out.reserve(words.size());
-    for (const auto &w : words) out.push_back(Tokenizer::stem(w));
-    return out;
-}
-
 void set_stopword_stems(const std::vector<std::string> &stems) {
     g_tok.set_stopword_stems(stems);
 }
@@ -41,7 +34,6 @@ std::pair<std::vector<std::string>, int> tokenize_doc(const std::string &text) {
 PYBIND11_MODULE(_stem_cpp, m) {
     m.doc() = "Native English Snowball (Porter2) stemmer + fused tokenizer.";
     m.def("stem", &stem, py::arg("word"));
-    m.def("stem_many", &stem_many, py::arg("words"));
     m.def("set_stopword_stems", &set_stopword_stems, py::arg("stems"));
     m.def("tokenize_doc", &tokenize_doc, py::arg("text"));
 }

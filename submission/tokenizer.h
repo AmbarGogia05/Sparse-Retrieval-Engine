@@ -7,9 +7,8 @@
 // materialise as a Python list, while the query path still returns a list.
 //
 // The implementation is a byte-for-byte port of nltk's EnglishStemmer.stem and
-// indexer.tokenize_v2, validated to 0 mismatches on 441K words + all corpus
-// docs. Do NOT alter the algorithm without re-validating against nltk — the
-// index is byte-identical only as long as this matches.
+// indexer._tokenize_python. Do not alter the algorithm without re-validating
+// against nltk: build and query tokenization must remain identical.
 
 #pragma once
 

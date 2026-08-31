@@ -1,11 +1,11 @@
-"""Combined scorer: weighted RRF fusion of an RM3-expanded BM25 arm and a VSM
-arm. This is the shipped competition entry (assignment Section 4.1)."""
+"""Combined scorer: weighted RRF fusion of an RM3/BM25 arm and a VSM arm.
+This is the shipped competition entry (assignment Section 4.1)."""
 import os
 from typing import List, Tuple
 
-from submission.indexer import InvertedIndex, tokenize
 from submission import bm25
 from submission import boolean_vsm
+from submission.indexer import InvertedIndex, tokenize
 
 USE_RM3 = os.environ.get("SRE_RM3", "1") != "0"
 
@@ -15,16 +15,12 @@ RRF_K = 60
 BM25_K1 = 1.8
 BM25_B = 0.6
 
-# The candidate-era cross-corpus sweep selected .85 using the non-COVID probes:
-# it improves NFCorpus, FiQA, and Antique over .70, while changing the public
-# COVID proxy only slightly. This is chosen from generalization probes rather
-# than a COVID-only argmax.
+# Shipped fusion weight for the BM25 arm; override for local experiments.
 W_BM = float(os.environ.get("SRE_W_BM", 0.85))  # VSM gets 1 - W_BM
 
-# RM3 pseudo-relevance feedback, native path only (needs the forward index):
-# round-1 BM25 -> relevance model over the top-R docs -> interpolate with the
-# original query at weight RM3_LAMBDA -> weighted round-2 BM25. These are the
-# candidate-era generalization settings.
+# RM3 pseudo-relevance feedback, native path only (needs the reconstructed
+# forward view): round-1 BM25 -> relevance model over the top-R docs ->
+# interpolation with the original query -> weighted round-2 BM25.
 RM3_R = int(os.environ.get("SRE_RM3_R", 15))
 RM3_M = int(os.environ.get("SRE_RM3_M", 30))
 RM3_LAMBDA = float(os.environ.get("SRE_RM3_LAMBDA", 0.6))
@@ -32,22 +28,17 @@ RM3_K1_ROUND2 = float(os.environ.get("SRE_RM3_K1_ROUND2", 1.2))
 RM3_B_ROUND2 = float(os.environ.get("SRE_RM3_B_ROUND2", 0.4))
 
 # Feedback-document weights are a softmax of the round-1 BM25 score over the
-# top-R docs (normalised by the top score, so the weighting is scale-free
-# across corpora) rather than score/sum, which lets one anomalous top document
-# dominate the relevance model. RM3_NOVEL keeps the M expansion slots for terms
-# the query doesn't already contain. The two are superadditive: +0.002 each,
-# +0.009 together, pooled over 1221 queries on four corpora. The temperature is
-# the interior of the [0.10, 0.20] band that is non-negative on every corpus,
-# not any single corpus's argmax. See runs/rm3_feedback_weighting.md
+# top-R docs, normalised by the top score. RM3_NOVEL reserves the M expansion
+# slots for terms not already present in the query. Both settings are
+# configurable for experiments.
 RM3_FB_TEMP = float(os.environ.get("SRE_RM3_FB_TEMP", 0.10))
 RM3_NOVEL = os.environ.get("SRE_RM3_NOVEL", "1") != "0"
 
-# At RRF_K=60 a doc at rank 500 contributes 1/560, far below anything that
-# reaches the fused top 10 — a doc ranked >500 in BOTH arms cannot surface. A
-# A document ranked >500 in both arms cannot surface in the fused top ten.
+# At RRF_K=60 a document ranked beyond 500 in both arms cannot surface in the
+# fused top ten.
 _CAND = 500
 # Small IDF-weighted distinct-query-term coverage rerank on only the fused top
-# ten. The alpha/depth pair was positive on all four probe corpora.
+# ten.
 _COVERAGE_RERANK_ALPHA = 0.30
 _COVERAGE_RERANK_DEPTH = 10
 # Conservative early-document presence tie-breaker. A sparse side stream records
@@ -74,13 +65,8 @@ def build_native(index_dir: str) -> None:
     _NATIVE = NativeIndex(index_dir)
 
 
-def _ranks(hits: List[Tuple[str, float]]) -> dict:
-    """doc_id -> 1-based rank from a (doc_id, score) list, best first."""
-    return {doc_id: i for i, (doc_id, _) in enumerate(hits, start=1)}
-
-
 def score(query: str, k: int) -> List[Tuple[str, float]]:
-    """Return up to k (doc_id, rrf_score) pairs for `query`, best first."""
+    """Return up to k (doc_id, final_score) pairs for `query`, best first."""
     if _NATIVE is not None:
         tokens = tokenize(query)
         # VSM always scores the ORIGINAL query — the fusion pays for arm
@@ -99,9 +85,11 @@ def score(query: str, k: int) -> List[Tuple[str, float]]:
         vs_hits = boolean_vsm.vsm_score(query, _CAND)
 
     fused = {}
-    for hits, w in ((bm_hits, W_BM), (vs_hits, 1 - W_BM)):
-        for doc_id, r in _ranks(hits).items():
-            fused[doc_id] = fused.get(doc_id, 0.0) + w / (RRF_K + r)
+    for hits, weight in ((bm_hits, W_BM), (vs_hits, 1 - W_BM)):
+        for rank, (doc_id, _) in enumerate(hits, start=1):
+            fused[doc_id] = (
+                fused.get(doc_id, 0.0) + weight / (RRF_K + rank)
+            )
 
     ranked = sorted(fused.items(), key=lambda x: (-x[1], x[0]))
     if _NATIVE is not None and _COVERAGE_RERANK_ALPHA > 0.0:
