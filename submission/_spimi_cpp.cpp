@@ -430,8 +430,9 @@ static T rd(std::ifstream &f) { T v; f.read(reinterpret_cast<char *>(&v), sizeof
 // list of m = ords.size() ascending doc ordinals in [0,N): l = floor(log2(N/m))
 // low bits/value packed LSB-first byte-padded; a unary high stream ((hi-prev)
 // zeros then a 1) byte-padded; then, unless all_tf_one is true, (tf-1) in
-// 128-blocks (width byte + packed). tf1.bin records which terms omit that
-// final section.
+// adaptive 128-value blocks. A header below 0x80 is the legacy fixed bit
+// width; a header with bit 7 set is Rice coding with k in the low five bits.
+// tf1.bin records which terms omit that final section.
 // Must stay byte-identical to indexer._encode_postings and _index_cpp
 // NativeIndex::get_postings (which recomputes l from m,N and decodes this).
 static void put_postings_ef(std::string &out, const std::vector<uint32_t> &ords,
@@ -464,15 +465,72 @@ static void put_postings_ef(std::string &out, const std::vector<uint32_t> &ords,
         if (nb) out.push_back(static_cast<char>(buf & 0xFF));
     }
     if (all_tf_one) return;
-    // tf-1 in blocks of 128.
+    // tf-1 in adaptive blocks of 128. Rice is particularly effective here
+    // because most values are zero (tf == 1), while the fixed-width fallback
+    // prevents isolated large term frequencies from making unary quotients
+    // expensive.
     long done = 0;
     while (done < m) {
         long k = std::min(static_cast<long>(128), m - done);
         uint32_t mx = 0;
         for (long j = 0; j < k; j++) { uint32_t v = tfs[done + j] - 1; if (v > mx) mx = v; }
         int width = 0; { uint32_t t = mx; while (t) { t >>= 1; width++; } }
-        out.push_back(static_cast<char>(width));
-        if (width > 0) {
+
+        uint64_t fixed_bytes =
+            (static_cast<uint64_t>(k) * static_cast<uint64_t>(width) + 7u) / 8u;
+        int best_rice_k = 0;
+        uint64_t best_rice_bits = std::numeric_limits<uint64_t>::max();
+        int max_rice_k = std::min(width, 31);
+        for (int rice_k = 0; rice_k <= max_rice_k; rice_k++) {
+            uint64_t bits = 0;
+            for (long j = 0; j < k; j++) {
+                uint32_t value = tfs[done + j] - 1;
+                bits += static_cast<uint64_t>(value >> rice_k) +
+                        1u + static_cast<uint64_t>(rice_k);
+            }
+            if (bits < best_rice_bits) {
+                best_rice_bits = bits;
+                best_rice_k = rice_k;
+            }
+        }
+        uint64_t rice_bytes = (best_rice_bits + 7u) / 8u;
+        bool use_rice = rice_bytes < fixed_bytes;
+        out.push_back(static_cast<char>(
+            use_rice ? (0x80u | static_cast<unsigned>(best_rice_k))
+                     : static_cast<unsigned>(width)));
+
+        if (use_rice) {
+            uint64_t buf = 0;
+            int nb = 0;
+            auto put_bits = [&](uint32_t value, int bits) {
+                if (bits == 0) return;
+                buf |= static_cast<uint64_t>(value) << nb;
+                nb += bits;
+                while (nb >= 8) {
+                    out.push_back(static_cast<char>(buf & 0xFFu));
+                    buf >>= 8;
+                    nb -= 8;
+                }
+            };
+            uint32_t remainder_mask = best_rice_k
+                ? ((1u << best_rice_k) - 1u)
+                : 0u;
+            for (long j = 0; j < k; j++) {
+                uint32_t value = tfs[done + j] - 1;
+                uint32_t quotient = value >> best_rice_k;
+                while (quotient >= 32) {
+                    put_bits(0xFFFFFFFFu, 32);
+                    quotient -= 32;
+                }
+                if (quotient)
+                    put_bits((1u << quotient) - 1u,
+                             static_cast<int>(quotient));
+                put_bits(0, 1);
+                if (best_rice_k)
+                    put_bits(value & remainder_mask, best_rice_k);
+            }
+            if (nb) out.push_back(static_cast<char>(buf & 0xFFu));
+        } else if (width > 0) {
             uint64_t buf = 0; int nb = 0;
             uint32_t wmask = (width >= 32) ? 0xFFFFFFFFu : ((1u << width) - 1u);
             for (long j = 0; j < k; j++) {

@@ -112,9 +112,38 @@ def _encode_tf_blocks(values: List[int]) -> bytes:
     for start in range(0, len(values), EF_BLOCK_SIZE):
         block = values[start:start + EF_BLOCK_SIZE]
         width = max(block, default=0).bit_length()
-        writer.write(width, 8)
-        for value in block:
-            writer.write(value, width)
+
+        # Header bytes below 0x80 retain the legacy fixed-width format. A
+        # header with the high bit set selects Rice coding and stores k in the
+        # low five bits. Pick Rice only when its byte-padded payload is strictly
+        # smaller, so no block can regress relative to the old codec.
+        fixed_bytes = (len(block) * width + 7) // 8
+        best_k = 0
+        best_rice_bits = None
+        for k in range(min(width, 31) + 1):
+            rice_bits = sum((value >> k) + 1 + k for value in block)
+            if best_rice_bits is None or rice_bits < best_rice_bits:
+                best_rice_bits = rice_bits
+                best_k = k
+        rice_bytes = ((best_rice_bits or 0) + 7) // 8
+        use_rice = rice_bytes < fixed_bytes
+
+        writer.write((0x80 | best_k) if use_rice else width, 8)
+        if use_rice:
+            remainder_mask = (1 << best_k) - 1
+            for value in block:
+                quotient = value >> best_k
+                while quotient >= 32:
+                    writer.write(0xFFFFFFFF, 32)
+                    quotient -= 32
+                if quotient:
+                    writer.write((1 << quotient) - 1, quotient)
+                writer.write(0, 1)
+                if best_k:
+                    writer.write(value & remainder_mask, best_k)
+        else:
+            for value in block:
+                writer.write(value, width)
         if writer.bits:
             writer.data.append(writer.buffer & 0xFF)
             writer.buffer = 0
@@ -129,10 +158,21 @@ def _decode_tf_blocks(
     values: List[int] = []
     while len(values) < count:
         block_size = min(EF_BLOCK_SIZE, count - len(values))
-        width = reader.read(8)
-        values.extend(
-            reader.read(width) if width else 0 for _ in range(block_size)
-        )
+        header = reader.read(8)
+        if header & 0x80:
+            k = header & 0x1F
+            remainder_mask = (1 << k) - 1
+            for _ in range(block_size):
+                quotient = 0
+                while reader.read_bit():
+                    quotient += 1
+                remainder = reader.read(k) & remainder_mask if k else 0
+                values.append((quotient << k) | remainder)
+        else:
+            width = header
+            values.extend(
+                reader.read(width) if width else 0 for _ in range(block_size)
+            )
         reader.align()
     return values, reader.pos
 

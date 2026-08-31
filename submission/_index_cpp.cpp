@@ -85,9 +85,11 @@ struct NativeIndex {
     }
 
     // Inverse of _spimi_cpp.cpp's put_postings_ef / indexer._encode_postings:
-    // Elias-Fano for monotone doc ordinals, followed by (tf-1) in 128-posting
-    // blocks. For terms marked in tf1.bin, all tfs are one and the TF section
-    // is omitted. l is recomputed from (df, N), not stored.
+    // Elias-Fano for monotone doc ordinals, followed by (tf-1) in adaptive
+    // 128-posting blocks. Legacy header bytes below 0x80 specify a fixed bit
+    // width; headers with bit 7 set specify Rice coding with k in the low five
+    // bits. For terms marked in tf1.bin, all tfs are one and the TF section is
+    // omitted. l is recomputed from (df, N), not stored.
     static void get_postings(const unsigned char *p, size_t &pos, long df, long N,
                              std::vector<int> &ords, std::vector<int> &tfs,
                              bool all_tf_one = false) {
@@ -98,25 +100,60 @@ struct NativeIndex {
             tfs.assign(m, 1);
             return;
         }
-        // tf blocks: (tf-1) in blocks of 128, per block a width byte then packed.
+        // tf blocks: (tf-1) in blocks of 128, each independently fixed-width
+        // or Rice-coded according to its header.
         long done = 0;
         while (done < m) {
-            long k = std::min(static_cast<long>(128), m - done);
-            int width = p[pos++];
-            if (width == 0) {
-                for (long j = 0; j < k; j++) tfs[done + j] = 1;
-            } else {
+            long block_size = std::min(static_cast<long>(128), m - done);
+            int header = p[pos++];
+            if (header & 0x80) {
+                int rice_k = header & 0x1F;
                 uint64_t buf = 0;
                 int nb = 0;
-                long wmask = (1L << width) - 1;
-                for (long j = 0; j < k; j++) {
-                    while (nb < width) { buf |= static_cast<uint64_t>(p[pos++]) << nb; nb += 8; }
-                    tfs[done + j] = static_cast<int>((buf & wmask) + 1);
-                    buf >>= width;
-                    nb -= width;
+                auto read_bits = [&](int bits) -> uint32_t {
+                    while (nb < bits) {
+                        buf |= static_cast<uint64_t>(p[pos++]) << nb;
+                        nb += 8;
+                    }
+                    uint32_t value = bits
+                        ? static_cast<uint32_t>(
+                              buf & ((1ULL << bits) - 1ULL))
+                        : 0u;
+                    buf >>= bits;
+                    nb -= bits;
+                    return value;
+                };
+                for (long j = 0; j < block_size; j++) {
+                    uint32_t quotient = 0;
+                    while (read_bits(1) != 0) quotient++;
+                    uint32_t remainder =
+                        rice_k ? read_bits(rice_k) : 0u;
+                    uint32_t value =
+                        (quotient << rice_k) | remainder;
+                    tfs[done + j] = static_cast<int>(value + 1u);
+                }
+            } else {
+                int width = header;
+                if (width == 0) {
+                    for (long j = 0; j < block_size; j++)
+                        tfs[done + j] = 1;
+                } else {
+                    uint64_t buf = 0;
+                    int nb = 0;
+                    uint64_t wmask = (1ULL << width) - 1ULL;
+                    for (long j = 0; j < block_size; j++) {
+                        while (nb < width) {
+                            buf |= static_cast<uint64_t>(p[pos++]) << nb;
+                            nb += 8;
+                        }
+                        tfs[done + j] =
+                            static_cast<int>((buf & wmask) + 1u);
+                        buf >>= width;
+                        nb -= width;
+                    }
                 }
             }
-            done += k;
+            done += block_size;
         }
     }
 
