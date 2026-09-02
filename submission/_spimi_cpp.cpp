@@ -376,29 +376,33 @@ static void compact_docids(const std::string &dir) {
     }
     std::ofstream out(dir + "/docids.bin", std::ios::binary);
     out.write("D36", 3);
-    out.put(static_cast<char>(1));
+    out.put(static_cast<char>(2));
+    uint64_t buffer = 0;
+    int bits = 0;
     for (uint64_t value : values) {
-        for (int i = 0; i < 6; i++) {
-            out.put(static_cast<char>(value & 0xFFu));
-            value >>= 8;
+        buffer |= value << bits;
+        bits += 42;
+        while (bits >= 8) {
+            out.put(static_cast<char>(buffer & 0xFFu));
+            buffer >>= 8;
+            bits -= 8;
         }
     }
+    if (bits) out.put(static_cast<char>(buffer & 0xFFu));
     out.close();
     std::remove((dir + "/docs.txt").c_str());
 }
 
-// Append one front-coded term record to `out` (terms.txt is front-coded and
-// alphabetical): VByte(shared prefix len with prev) VByte(suffix len) suffix
-// VByte(df); updates prev. Mirrors indexer._encode_terms and the terms reader
-// in _index_cpp.cpp.
+// Append one TM2 front-coded term record: VByte(shared prefix length), suffix,
+// NUL. Document frequencies are appended as one contiguous VByte stream after
+// all terms, improving the outer compressor's locality.
 static void put_term_frontcoded(std::string &out, std::string &prev,
-                                const std::string &term, long df) {
+                                const std::string &term) {
     size_t s = 0, mm = std::min(prev.size(), term.size());
     while (s < mm && prev[s] == term[s]) s++;
     put_vbyte(out, static_cast<long>(s));
-    put_vbyte(out, static_cast<long>(term.size() - s));
     out.append(term, s, term.size() - s);
-    put_vbyte(out, df);
+    out.push_back('\0');
     prev = term;
 }
 
@@ -426,187 +430,274 @@ static void wr(std::ofstream &f, T v) { f.write(reinterpret_cast<const char *>(&
 template <typename T>
 static T rd(std::ifstream &f) { T v; f.read(reinterpret_cast<char *>(&v), sizeof(T)); return v; }
 
-// Elias-Fano encoder for the final postings.bin. One posting
-// list of m = ords.size() ascending doc ordinals in [0,N): l = floor(log2(N/m))
-// low bits/value packed LSB-first byte-padded; a unary high stream ((hi-prev)
-// zeros then a 1) byte-padded; then, unless all_tf_one is true, (tf-1) in
-// adaptive 128-value blocks. A header below 0x80 is the legacy fixed bit
-// width; a header with bit 7 set is Rice coding with k in the low five bits.
-// tf1.bin records which terms omit that final section.
+static int posting_rice_k(long count, long universe) {
+    int k = 0;
+    if (count > 0) {
+        long q = universe / count;
+        if (q >= 1) {
+            while ((q >> 1) != 0) {
+                q >>= 1;
+                k++;
+            }
+        }
+    }
+    return k;
+}
+
+// Elias-Fano encoder for the final postings.bin. One posting list of
+// m = ords.size() ascending doc ordinals in [0,N): l = floor(log2(N/m)),
+// followed by (tf-1) in adaptive 128-value blocks unless all_tf_one is true.
+// TF4 Rice-codes each (doc gap - 1), using k = floor(log2(N/m)), then appends
+// sparse (position, excess) TF exceptions in one continuous per-term
+// bitstream. tf1.bin marks lists that need no TF stream because all values
+// are one.
 // Must stay byte-identical to indexer._encode_postings and _index_cpp
 // NativeIndex::get_postings (which recomputes l from m,N and decodes this).
 static void put_postings_ef(std::string &out, const std::vector<uint32_t> &ords,
                             const std::vector<uint32_t> &tfs, long N,
-                            bool all_tf_one = false) {
+                            bool all_tf_one, bool sparse_tf,
+                            uint64_t &buf, int &nb) {
     long m = static_cast<long>(ords.size());
-    int l = 0;
-    if (m > 0) { long q = N / m; if (q >= 1) { while ((q >> 1) != 0) { q >>= 1; l++; } } }
-    // Low bits.
-    {
-        uint64_t buf = 0; int nb = 0;
-        uint32_t mask = (l > 0) ? ((1u << l) - 1u) : 0u;
-        for (long i = 0; i < m; i++) {
-            buf |= static_cast<uint64_t>(ords[i] & mask) << nb; nb += l;
-            while (nb >= 8) { out.push_back(static_cast<char>(buf & 0xFF)); buf >>= 8; nb -= 8; }
+    int l = posting_rice_k(m, N);
+    auto put_bits = [&](uint32_t value, int bits) {
+        if (bits == 0) return;
+        buf |= static_cast<uint64_t>(value) << nb;
+        nb += bits;
+        while (nb >= 8) {
+            out.push_back(static_cast<char>(buf & 0xFFu));
+            buf >>= 8;
+            nb -= 8;
         }
-        if (nb) out.push_back(static_cast<char>(buf & 0xFF));
-    }
-    // High bits.
-    {
-        uint64_t buf = 0; int nb = 0; uint32_t prev = 0;
-        for (long i = 0; i < m; i++) {
-            uint32_t hi = ords[i] >> l;
-            nb += static_cast<int>(hi - prev);   // (hi-prev) zero bits
-            while (nb >= 8) { out.push_back(static_cast<char>(buf & 0xFF)); buf >>= 8; nb -= 8; }
-            buf |= static_cast<uint64_t>(1) << nb; nb += 1;  // terminating one bit
-            while (nb >= 8) { out.push_back(static_cast<char>(buf & 0xFF)); buf >>= 8; nb -= 8; }
-            prev = hi;
+    };
+    auto put_rice_value = [&](uint32_t value, int rice_k) {
+        uint32_t remainder_mask = rice_k
+            ? ((1u << rice_k) - 1u)
+            : 0u;
+        uint32_t quotient = value >> rice_k;
+        while (quotient >= 32) {
+            put_bits(0xFFFFFFFFu, 32);
+            quotient -= 32;
         }
-        if (nb) out.push_back(static_cast<char>(buf & 0xFF));
-    }
-    if (all_tf_one) return;
-    // tf-1 in adaptive blocks of 128. Rice is particularly effective here
-    // because most values are zero (tf == 1), while the fixed-width fallback
-    // prevents isolated large term frequencies from making unary quotients
-    // expensive.
-    long done = 0;
-    while (done < m) {
-        long k = std::min(static_cast<long>(128), m - done);
-        uint32_t mx = 0;
-        for (long j = 0; j < k; j++) { uint32_t v = tfs[done + j] - 1; if (v > mx) mx = v; }
-        int width = 0; { uint32_t t = mx; while (t) { t >>= 1; width++; } }
+        if (quotient)
+            put_bits((1u << quotient) - 1u,
+                     static_cast<int>(quotient));
+        put_bits(0, 1);
+        if (rice_k)
+            put_bits(value & remainder_mask, rice_k);
+    };
+    auto put_vbyte_bits = [&](uint32_t value) {
+        while (true) {
+            uint32_t byte = value & 0x7Fu;
+            value >>= 7;
+            if (!value) byte |= 0x80u;
+            put_bits(byte, 8);
+            if (!value) break;
+        }
+    };
+    auto put_tf_values = [&](const std::vector<uint32_t> &values) {
+        size_t done = 0;
+        while (done < values.size()) {
+            size_t count = std::min(static_cast<size_t>(128),
+                                    values.size() - done);
+            uint32_t mx = 0;
+            for (size_t j = 0; j < count; j++)
+                mx = std::max(mx, values[done + j]);
+            int width = 0;
+            for (uint32_t t = mx; t; t >>= 1) width++;
 
-        uint64_t fixed_bytes =
-            (static_cast<uint64_t>(k) * static_cast<uint64_t>(width) + 7u) / 8u;
-        int best_rice_k = 0;
-        uint64_t best_rice_bits = std::numeric_limits<uint64_t>::max();
-        int max_rice_k = std::min(width, 31);
-        for (int rice_k = 0; rice_k <= max_rice_k; rice_k++) {
-            uint64_t bits = 0;
-            for (long j = 0; j < k; j++) {
-                uint32_t value = tfs[done + j] - 1;
-                bits += static_cast<uint64_t>(value >> rice_k) +
-                        1u + static_cast<uint64_t>(rice_k);
+            uint64_t fixed_bits =
+                static_cast<uint64_t>(count) *
+                static_cast<uint64_t>(width);
+            uint64_t fixed_bytes = (fixed_bits + 7u) / 8u;
+            int best_rice_k = 0;
+            uint64_t best_rice_bits =
+                std::numeric_limits<uint64_t>::max();
+            for (int rice_k = 0;
+                 rice_k <= std::min(width, 31); rice_k++) {
+                uint64_t bits = 0;
+                for (size_t j = 0; j < count; j++)
+                    bits += static_cast<uint64_t>(
+                                values[done + j] >> rice_k)
+                            + 1u + static_cast<uint64_t>(rice_k);
+                if (bits < best_rice_bits) {
+                    best_rice_bits = bits;
+                    best_rice_k = rice_k;
+                }
             }
-            if (bits < best_rice_bits) {
-                best_rice_bits = bits;
-                best_rice_k = rice_k;
+            bool use_rice =
+                (best_rice_bits + 7u) / 8u < fixed_bytes;
+            put_bits(
+                use_rice
+                    ? (0x80u | static_cast<unsigned>(best_rice_k))
+                    : static_cast<unsigned>(width),
+                8);
+            if (use_rice) {
+                for (size_t j = 0; j < count; j++)
+                    put_rice_value(values[done + j], best_rice_k);
+            } else {
+                uint32_t mask = width
+                    ? ((1u << width) - 1u)
+                    : 0u;
+                for (size_t j = 0; j < count; j++)
+                    put_bits(values[done + j] & mask, width);
             }
+            done += count;
         }
-        uint64_t rice_bytes = (best_rice_bits + 7u) / 8u;
-        bool use_rice = rice_bytes < fixed_bytes;
-        out.push_back(static_cast<char>(
-            use_rice ? (0x80u | static_cast<unsigned>(best_rice_k))
-                     : static_cast<unsigned>(width)));
+    };
 
-        if (use_rice) {
-            uint64_t buf = 0;
-            int nb = 0;
-            auto put_bits = [&](uint32_t value, int bits) {
-                if (bits == 0) return;
-                buf |= static_cast<uint64_t>(value) << nb;
-                nb += bits;
-                while (nb >= 8) {
-                    out.push_back(static_cast<char>(buf & 0xFFu));
-                    buf >>= 8;
-                    nb -= 8;
-                }
-            };
-            uint32_t remainder_mask = best_rice_k
-                ? ((1u << best_rice_k) - 1u)
-                : 0u;
-            for (long j = 0; j < k; j++) {
-                uint32_t value = tfs[done + j] - 1;
-                uint32_t quotient = value >> best_rice_k;
-                while (quotient >= 32) {
-                    put_bits(0xFFFFFFFFu, 32);
-                    quotient -= 32;
-                }
-                if (quotient)
-                    put_bits((1u << quotient) - 1u,
-                             static_cast<int>(quotient));
-                put_bits(0, 1);
-                if (best_rice_k)
-                    put_bits(value & remainder_mask, best_rice_k);
-            }
-            if (nb) out.push_back(static_cast<char>(buf & 0xFFu));
-        } else if (width > 0) {
-            uint64_t buf = 0; int nb = 0;
-            uint32_t wmask = (width >= 32) ? 0xFFFFFFFFu : ((1u << width) - 1u);
-            for (long j = 0; j < k; j++) {
-                buf |= static_cast<uint64_t>((tfs[done + j] - 1) & wmask) << nb; nb += width;
-                while (nb >= 8) { out.push_back(static_cast<char>(buf & 0xFF)); buf >>= 8; nb -= 8; }
-            }
-            if (nb) out.push_back(static_cast<char>(buf & 0xFF));
+    int64_t previous = -1;
+    for (long start = 0; start < m; start += 32) {
+        long count = std::min(32L, m - start);
+        uint32_t gaps[32];
+        uint64_t gap_sum = 0;
+        for (long j = 0; j < count; j++) {
+            uint32_t value = static_cast<uint32_t>(
+                static_cast<int64_t>(
+                    ords[static_cast<size_t>(start + j)])
+                - previous - 1);
+            gaps[j] = value;
+            gap_sum += value;
+            previous = ords[static_cast<size_t>(start + j)];
         }
-        done += k;
+
+        uint64_t mean_gap = gap_sum / static_cast<uint64_t>(count);
+        int mean_k = 0;
+        while ((mean_gap >> 1) != 0) {
+            mean_gap >>= 1;
+            mean_k++;
+        }
+        mean_k = std::min(mean_k, 31);
+        int candidates[4] = {
+            l,
+            std::max(0, mean_k - 1),
+            mean_k,
+            std::min(31, mean_k + 1),
+        };
+        uint64_t global_bits = std::numeric_limits<uint64_t>::max();
+        uint64_t best_bits = std::numeric_limits<uint64_t>::max();
+        int best_k = l;
+        for (int ci = 0; ci < 4; ci++) {
+            int candidate = candidates[ci];
+            bool duplicate = false;
+            for (int earlier = 0; earlier < ci; earlier++)
+                duplicate = duplicate || candidates[earlier] == candidate;
+            if (duplicate) continue;
+            uint64_t candidate_bits =
+                static_cast<uint64_t>(count) *
+                static_cast<uint64_t>(candidate + 1);
+            for (long j = 0; j < count; j++)
+                candidate_bits += gaps[j] >> candidate;
+            if (candidate == l) global_bits = candidate_bits;
+            if (candidate_bits < best_bits) {
+                best_bits = candidate_bits;
+                best_k = candidate;
+            }
+        }
+
+        int delta = best_k - l;
+        int header_bits = (delta >= -3 && delta <= 3) ? 4 : 9;
+        if (best_bits + static_cast<uint64_t>(header_bits)
+                < global_bits + 1u) {
+            put_bits(1, 1);
+            if (delta >= -3 && delta <= 3) {
+                put_bits(static_cast<uint32_t>(delta + 3), 3);
+            } else {
+                put_bits(7, 3);
+                put_bits(static_cast<uint32_t>(best_k), 5);
+            }
+            for (long j = 0; j < count; j++)
+                put_rice_value(gaps[j], best_k);
+        } else {
+            put_bits(0, 1);
+            for (long j = 0; j < count; j++)
+                put_rice_value(gaps[j], l);
+        }
+    }
+
+    if (all_tf_one) {
+        return;
+    }
+
+    if (sparse_tf) {
+        std::vector<uint32_t> positions;
+        std::vector<uint32_t> excess;
+        for (size_t i = 0; i < tfs.size(); i++) {
+            if (tfs[i] > 1) {
+                positions.push_back(static_cast<uint32_t>(i));
+                excess.push_back(tfs[i] - 2);
+            }
+        }
+        put_vbyte_bits(static_cast<uint32_t>(positions.size()));
+        int position_k = posting_rice_k(
+            static_cast<long>(positions.size()), m);
+        int64_t previous_position = -1;
+        for (uint32_t position : positions) {
+            uint32_t value = static_cast<uint32_t>(
+                static_cast<int64_t>(position) - previous_position - 1);
+            put_rice_value(value, position_k);
+            previous_position = position;
+        }
+        put_tf_values(excess);
+    } else {
+        std::vector<uint32_t> dense;
+        dense.reserve(tfs.size());
+        for (uint32_t tf : tfs) dense.push_back(tf - 1);
+        put_tf_values(dense);
     }
 }
 
-// Elias-Fano encode a strictly increasing sequence in [0, universe), without
-// term frequencies. Used by early.bin for the sparse posting positions whose
-// early flag is set.
-static void put_monotone_ef(std::string &out, const std::vector<uint32_t> &vals,
-                            long universe) {
+// Rice-code gap-minus-one for a strictly increasing sequence in
+// [0, universe). The parameter is derived from (count, universe), so the
+// decoder needs no per-list metadata.
+static void put_monotone_rice(
+    std::string &out, const std::vector<uint32_t> &vals, long universe) {
     long m = static_cast<long>(vals.size());
-    int l = 0;
-    if (m > 0) {
-        long q = universe / m;
-        if (q >= 1) {
-            while ((q >> 1) != 0) { q >>= 1; l++; }
+    int k = posting_rice_k(m, universe);
+    uint32_t mask = k ? ((1u << k) - 1u) : 0u;
+    uint64_t buffer = 0;
+    int bits = 0;
+    auto put_bits = [&](uint32_t value, int width) {
+        if (!width) return;
+        buffer |= static_cast<uint64_t>(value) << bits;
+        bits += width;
+        while (bits >= 8) {
+            out.push_back(static_cast<char>(buffer & 0xFFu));
+            buffer >>= 8;
+            bits -= 8;
         }
-    }
-    {
-        uint64_t buf = 0;
-        int nb = 0;
-        uint32_t mask = (l > 0) ? ((1u << l) - 1u) : 0u;
-        for (long i = 0; i < m; i++) {
-            buf |= static_cast<uint64_t>(vals[i] & mask) << nb;
-            nb += l;
-            while (nb >= 8) {
-                out.push_back(static_cast<char>(buf & 0xFF));
-                buf >>= 8;
-                nb -= 8;
-            }
+    };
+
+    int64_t previous = -1;
+    for (uint32_t ordinal : vals) {
+        uint32_t value = static_cast<uint32_t>(
+            static_cast<int64_t>(ordinal) - previous - 1);
+        uint32_t quotient = value >> k;
+        while (quotient >= 32) {
+            put_bits(0xFFFFFFFFu, 32);
+            quotient -= 32;
         }
-        if (nb) out.push_back(static_cast<char>(buf & 0xFF));
+        if (quotient)
+            put_bits((1u << quotient) - 1u,
+                     static_cast<int>(quotient));
+        put_bits(0, 1);
+        if (k) put_bits(value & mask, k);
+        previous = ordinal;
     }
-    {
-        uint64_t buf = 0;
-        int nb = 0;
-        uint32_t prev = 0;
-        for (long i = 0; i < m; i++) {
-            uint32_t hi = vals[i] >> l;
-            nb += static_cast<int>(hi - prev);
-            while (nb >= 8) {
-                out.push_back(static_cast<char>(buf & 0xFF));
-                buf >>= 8;
-                nb -= 8;
-            }
-            buf |= static_cast<uint64_t>(1) << nb;
-            nb++;
-            while (nb >= 8) {
-                out.push_back(static_cast<char>(buf & 0xFF));
-                buf >>= 8;
-                nb -= 8;
-            }
-            prev = hi;
-        }
-        if (nb) out.push_back(static_cast<char>(buf & 0xFF));
-    }
+    if (bits) out.push_back(static_cast<char>(buffer & 0xFFu));
 }
 
 // Sparse early-posting stream:
-//   "SEF1"
+//   "SEF2"
 //   ceil(num_terms/8) presence bits (term has at least one early posting)
-//   for each present term: VByte(early_df), EF(posting positions, universe=df)
+//   for each present term:
+//       VByte(early_df), Rice(gap-minus-one posting positions, universe=df)
 //
 // Encoding positions within the ordinary posting list avoids repeating doc
 // ordinals. The sparse representation is smaller than a full aligned flag
 // stream and lets the reader retain only matching doc ordinals in memory.
 template <typename PerTerm>
 static std::string encode_early_sparse(const std::vector<PerTerm> &data) {
-    std::string out("SEF1", 4);
+    std::string out("SEF2", 4);
     size_t bitmap_pos = out.size();
     out.resize(bitmap_pos + (data.size() + 7) / 8, '\0');
     for (size_t ti = 0; ti < data.size(); ti++) {
@@ -622,7 +713,8 @@ static std::string encode_early_sparse(const std::vector<PerTerm> &data) {
         positions.reserve(m);
         for (size_t i = 0; i < flags.size(); i++)
             if (flags[i]) positions.push_back(static_cast<uint32_t>(i));
-        put_monotone_ef(out, positions, static_cast<long>(flags.size()));
+        put_monotone_rice(
+            out, positions, static_cast<long>(flags.size()));
     }
     return out;
 }
@@ -780,25 +872,34 @@ static void write_index(
     const std::unordered_set<std::string> &case_terms,
     uint32_t document_count,
     long total_document_length) {
-    std::string terms_blob;
+    std::string terms_blob("TM2", 3);
+    put_vbyte(terms_blob, static_cast<long>(terms.size()));
     std::string postings_blob;
-    std::string tf_one("TF1", 3);
+    uint64_t postings_buffer = 0;
+    int postings_bits = 0;
+    std::string tf_one("TF6", 3);
     tf_one.resize(3 + (terms.size() + 7) / 8, '\0');
 
     std::string previous_term;
     for (size_t i = 0; i < terms.size(); i++) {
-        put_term_frontcoded(terms_blob, previous_term, terms[i],
-                            static_cast<long>(data[i].ords.size()));
+        put_term_frontcoded(terms_blob, previous_term, terms[i]);
         bool all_one = std::all_of(
             data[i].tfs.begin(), data[i].tfs.end(),
             [](uint32_t tf) { return tf == 1; });
+        bool sparse_tf = !all_one;
         if (all_one)
             tf_one[3 + i / 8] = static_cast<char>(
                 static_cast<unsigned char>(tf_one[3 + i / 8]) |
                 static_cast<unsigned char>(1u << (i % 8)));
         put_postings_ef(postings_blob, data[i].ords, data[i].tfs,
-                        static_cast<long>(document_count), all_one);
+                        static_cast<long>(document_count), all_one,
+                        sparse_tf, postings_buffer, postings_bits);
     }
+    for (const auto &postings : data)
+        put_vbyte(terms_blob, static_cast<long>(postings.ords.size()));
+    if (postings_bits)
+        postings_blob.push_back(
+            static_cast<char>(postings_buffer & 0xFFu));
 
     std::string early_blob = encode_early_sparse(data);
     std::ofstream(dir + "/terms.txt", std::ios::binary)

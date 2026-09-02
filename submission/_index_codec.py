@@ -8,8 +8,11 @@ from typing import List, Tuple
 
 
 EF_BLOCK_SIZE = 128
+DOC_GAP_BLOCK_SIZE = 32
 DOCID_MAGIC = b"D36\x01"
+DOCID_PACKED_MAGIC = b"D36\x02"
 CASE_TERMS_MAGIC = b"CT1"
+TERMS_MAGIC = b"TM2"
 
 
 def encode_vbyte(numbers: List[int]) -> bytes:
@@ -111,44 +114,95 @@ def _encode_tf_blocks(values: List[int]) -> bytes:
     writer = _BitWriter()
     for start in range(0, len(values), EF_BLOCK_SIZE):
         block = values[start:start + EF_BLOCK_SIZE]
-        width = max(block, default=0).bit_length()
-
-        # Header bytes below 0x80 retain the legacy fixed-width format. A
-        # header with the high bit set selects Rice coding and stores k in the
-        # low five bits. Pick Rice only when its byte-padded payload is strictly
-        # smaller, so no block can regress relative to the old codec.
-        fixed_bytes = (len(block) * width + 7) // 8
-        best_k = 0
-        best_rice_bits = None
-        for k in range(min(width, 31) + 1):
-            rice_bits = sum((value >> k) + 1 + k for value in block)
-            if best_rice_bits is None or rice_bits < best_rice_bits:
-                best_rice_bits = rice_bits
-                best_k = k
-        rice_bytes = ((best_rice_bits or 0) + 7) // 8
-        use_rice = rice_bytes < fixed_bytes
-
-        writer.write((0x80 | best_k) if use_rice else width, 8)
-        if use_rice:
-            remainder_mask = (1 << best_k) - 1
-            for value in block:
-                quotient = value >> best_k
-                while quotient >= 32:
-                    writer.write(0xFFFFFFFF, 32)
-                    quotient -= 32
-                if quotient:
-                    writer.write((1 << quotient) - 1, quotient)
-                writer.write(0, 1)
-                if best_k:
-                    writer.write(value & remainder_mask, best_k)
-        else:
-            for value in block:
-                writer.write(value, width)
+        _write_tf_block(writer, block)
         if writer.bits:
             writer.data.append(writer.buffer & 0xFF)
             writer.buffer = 0
             writer.bits = 0
     return writer.finish()
+
+
+def _write_tf_block(writer: _BitWriter, block: List[int]) -> None:
+    width, use_rice, best_k, _payload_bits = _tf_block_plan(block)
+
+    writer.write((0x80 | best_k) if use_rice else width, 8)
+    if use_rice:
+        _write_rice_values(writer, block, best_k)
+    else:
+        for value in block:
+            writer.write(value, width)
+
+
+def _tf_block_plan(block: List[int]) -> Tuple[int, bool, int, int]:
+    width = max(block, default=0).bit_length()
+
+    # Header bytes below 0x80 retain the legacy fixed-width format. A header
+    # with the high bit set selects Rice coding and stores k in the low five
+    # bits. Pick Rice only when its byte-padded payload is strictly smaller, so
+    # no block can regress relative to the old codec.
+    fixed_bytes = (len(block) * width + 7) // 8
+    best_k = 0
+    best_rice_bits = None
+    for k in range(min(width, 31) + 1):
+        rice_bits = sum((value >> k) + 1 + k for value in block)
+        if best_rice_bits is None or rice_bits < best_rice_bits:
+            best_rice_bits = rice_bits
+            best_k = k
+    rice_bytes = ((best_rice_bits or 0) + 7) // 8
+    use_rice = rice_bytes < fixed_bytes
+    payload_bits = (best_rice_bits or 0) if use_rice else len(block) * width
+    return width, use_rice, best_k, payload_bits
+
+
+def _write_rice_values(
+    writer: _BitWriter, values: List[int], k: int
+) -> None:
+    remainder_mask = (1 << k) - 1
+    for value in values:
+        quotient = value >> k
+        while quotient >= 32:
+            writer.write(0xFFFFFFFF, 32)
+            quotient -= 32
+        if quotient:
+            writer.write((1 << quotient) - 1, quotient)
+        writer.write(0, 1)
+        if k:
+            writer.write(value & remainder_mask, k)
+
+
+def _write_vbyte_to_bits(writer: _BitWriter, number: int) -> None:
+    for byte in encode_vbyte([number]):
+        writer.write(byte, 8)
+
+
+def _read_vbyte_from_bits(reader: _BitReader) -> int:
+    number = 0
+    shift = 0
+    while True:
+        byte = reader.read(8)
+        number |= (byte & 0x7F) << shift
+        if byte & 0x80:
+            return number
+        shift += 7
+
+
+def _read_tf_block(
+    reader: _BitReader, block_size: int
+) -> List[int]:
+    header = reader.read(8)
+    if header & 0x80:
+        k = header & 0x1F
+        values = []
+        for _ in range(block_size):
+            quotient = 0
+            while reader.read_bit():
+                quotient += 1
+            remainder = reader.read(k) if k else 0
+            values.append((quotient << k) | remainder)
+        return values
+
+    width = header
+    return [reader.read(width) if width else 0 for _ in range(block_size)]
 
 
 def _decode_tf_blocks(
@@ -158,21 +212,7 @@ def _decode_tf_blocks(
     values: List[int] = []
     while len(values) < count:
         block_size = min(EF_BLOCK_SIZE, count - len(values))
-        header = reader.read(8)
-        if header & 0x80:
-            k = header & 0x1F
-            remainder_mask = (1 << k) - 1
-            for _ in range(block_size):
-                quotient = 0
-                while reader.read_bit():
-                    quotient += 1
-                remainder = reader.read(k) & remainder_mask if k else 0
-                values.append((quotient << k) | remainder)
-        else:
-            width = header
-            values.extend(
-                reader.read(width) if width else 0 for _ in range(block_size)
-            )
+        values.extend(_read_tf_block(reader, block_size))
         reader.align()
     return values, reader.pos
 
@@ -182,10 +222,25 @@ def encode_postings(
     term_frequencies: List[int],
     document_count: int,
     all_tf_one: bool = False,
+    packed: bool = False,
+    gap_rice: bool = False,
+    sparse_tf: bool = False,
+    adaptive_gap_rice: bool = False,
 ) -> bytes:
     count = len(ordinals)
     width = _ef_width(count, document_count)
     mask = (1 << width) - 1
+
+    if packed:
+        writer = _BitWriter()
+        _write_packed_postings(
+            writer, ordinals, term_frequencies, document_count,
+            all_tf_one=all_tf_one,
+            gap_rice=gap_rice,
+            sparse_tf=sparse_tf,
+            adaptive_gap_rice=adaptive_gap_rice,
+        )
+        return writer.finish()
 
     low_writer = _BitWriter()
     for ordinal in ordinals:
@@ -206,15 +261,216 @@ def encode_postings(
     return bytes(encoded)
 
 
+def _write_packed_postings(
+    writer: _BitWriter,
+    ordinals: List[int],
+    term_frequencies: List[int],
+    document_count: int,
+    all_tf_one: bool = False,
+    gap_rice: bool = False,
+    sparse_tf: bool = False,
+    adaptive_gap_rice: bool = False,
+) -> None:
+    """Append one term without alignment; TF5 reuses the writer across terms."""
+    count = len(ordinals)
+    width = _ef_width(count, document_count)
+    mask = (1 << width) - 1
+
+    if gap_rice:
+        previous = -1
+        gaps = []
+        for ordinal in ordinals:
+            gaps.append(ordinal - previous - 1)
+            previous = ordinal
+        if adaptive_gap_rice:
+            for start in range(0, len(gaps), DOC_GAP_BLOCK_SIZE):
+                block = gaps[start:start + DOC_GAP_BLOCK_SIZE]
+                global_bits = sum(
+                    (value >> width) + 1 + width for value in block
+                )
+                mean_width = min(
+                    (sum(block) // len(block)).bit_length() - 1,
+                    31,
+                )
+                mean_width = max(mean_width, 0)
+                candidates = {
+                    max(mean_width - 1, 0),
+                    mean_width,
+                    min(mean_width + 1, 31),
+                }
+                costs = [
+                    (
+                        sum((value >> k) + 1 + k for value in block),
+                        k,
+                    )
+                    for k in candidates
+                ]
+                best_bits, best_k = min(costs)
+                delta = best_k - width
+                header_bits = 4 if -3 <= delta <= 3 else 9
+                if best_bits + header_bits < global_bits + 1:
+                    writer.write(1, 1)
+                    if -3 <= delta <= 3:
+                        writer.write(delta + 3, 3)
+                    else:
+                        writer.write(7, 3)
+                        writer.write(best_k, 5)
+                    _write_rice_values(writer, block, best_k)
+                else:
+                    writer.write(0, 1)
+                    _write_rice_values(writer, block, width)
+        else:
+            _write_rice_values(writer, gaps, width)
+    else:
+        for ordinal in ordinals:
+            writer.write(ordinal & mask, width)
+
+        previous_high = 0
+        for ordinal in ordinals:
+            high = ordinal >> width
+            writer.write(0, high - previous_high)
+            writer.write(1, 1)
+            previous_high = high
+
+    if sparse_tf:
+        positions = [
+            index for index, tf in enumerate(term_frequencies)
+            if tf > 1
+        ]
+        _write_vbyte_to_bits(writer, len(positions))
+        position_width = _ef_width(len(positions), count)
+        previous = -1
+        gaps = []
+        for position in positions:
+            gaps.append(position - previous - 1)
+            previous = position
+        _write_rice_values(writer, gaps, position_width)
+        excess = [
+            tf - 2 for tf in term_frequencies if tf > 1
+        ]
+        for start in range(0, len(excess), EF_BLOCK_SIZE):
+            _write_tf_block(
+                writer, excess[start:start + EF_BLOCK_SIZE]
+            )
+    elif not all_tf_one:
+        values = [tf - 1 for tf in term_frequencies]
+        for start in range(0, len(values), EF_BLOCK_SIZE):
+            _write_tf_block(
+                writer, values[start:start + EF_BLOCK_SIZE]
+            )
+
+
+def _decode_packed_postings(
+    reader: _BitReader,
+    document_frequency: int,
+    document_count: int,
+    all_tf_one: bool = False,
+    gap_rice: bool = False,
+    sparse_tf: bool = False,
+    adaptive_gap_rice: bool = False,
+) -> Tuple[List[int], List[int]]:
+    count = document_frequency
+    width = _ef_width(count, document_count)
+    if gap_rice:
+        ordinals = []
+        previous = -1
+        done = 0
+        while done < count:
+            block_size = min(DOC_GAP_BLOCK_SIZE, count - done)
+            rice_k = width
+            if adaptive_gap_rice and reader.read_bit():
+                code = reader.read(3)
+                rice_k = (
+                    reader.read(5) if code == 7
+                    else width + code - 3
+                )
+            for _ in range(block_size):
+                quotient = 0
+                while reader.read_bit():
+                    quotient += 1
+                remainder = reader.read(rice_k) if rice_k else 0
+                previous += ((quotient << rice_k) | remainder) + 1
+                ordinals.append(previous)
+            done += block_size
+    else:
+        low_bits = [
+            reader.read(width) if width else 0 for _ in range(count)
+        ]
+
+        ordinals = []
+        high = 0
+        while len(ordinals) < count:
+            if reader.read_bit():
+                ordinals.append(
+                    (high << width) | low_bits[len(ordinals)]
+                )
+            else:
+                high += 1
+
+    if all_tf_one:
+        term_frequencies = [1] * count
+    elif sparse_tf:
+        exception_count = _read_vbyte_from_bits(reader)
+        position_width = _ef_width(exception_count, count)
+        positions = []
+        previous = -1
+        for _ in range(exception_count):
+            quotient = 0
+            while reader.read_bit():
+                quotient += 1
+            remainder = (
+                reader.read(position_width) if position_width else 0
+            )
+            previous += (
+                (quotient << position_width) | remainder
+            ) + 1
+            positions.append(previous)
+
+        excess: List[int] = []
+        while len(excess) < exception_count:
+            block_size = min(
+                EF_BLOCK_SIZE, exception_count - len(excess)
+            )
+            excess.extend(_read_tf_block(reader, block_size))
+        term_frequencies = [1] * count
+        for position, value in zip(positions, excess):
+            term_frequencies[position] = value + 2
+    else:
+        tf_minus_one: List[int] = []
+        while len(tf_minus_one) < count:
+            block_size = min(
+                EF_BLOCK_SIZE, count - len(tf_minus_one)
+            )
+            tf_minus_one.extend(_read_tf_block(reader, block_size))
+        term_frequencies = [value + 1 for value in tf_minus_one]
+    return ordinals, term_frequencies
+
+
 def decode_postings(
     data: bytes,
     pos: int,
     document_frequency: int,
     document_count: int,
     all_tf_one: bool = False,
+    packed: bool = False,
+    gap_rice: bool = False,
+    sparse_tf: bool = False,
+    adaptive_gap_rice: bool = False,
 ) -> Tuple[List[int], List[int], int]:
     count = document_frequency
     width = _ef_width(count, document_count)
+
+    if packed:
+        reader = _BitReader(data, pos)
+        ordinals, term_frequencies = _decode_packed_postings(
+            reader, count, document_count,
+            all_tf_one=all_tf_one,
+            gap_rice=gap_rice,
+            sparse_tf=sparse_tf,
+            adaptive_gap_rice=adaptive_gap_rice,
+        )
+        reader.align()
+        return ordinals, term_frequencies, reader.pos
 
     low_reader = _BitReader(data, pos)
     low_bits = [low_reader.read(width) if width else 0 for _ in range(count)]
@@ -238,7 +494,8 @@ def decode_postings(
 
 
 def encode_terms(term_metadata: List[Tuple[str, int]]) -> bytes:
-    out = bytearray()
+    out = bytearray(TERMS_MAGIC)
+    out += encode_vbyte([len(term_metadata)])
     previous = ""
     for term, document_frequency in term_metadata:
         shared = 0
@@ -246,14 +503,32 @@ def encode_terms(term_metadata: List[Tuple[str, int]]) -> bytes:
         while shared < limit and previous[shared] == term[shared]:
             shared += 1
         suffix = term[shared:].encode("utf-8")
-        out += encode_vbyte([shared, len(suffix)])
+        out += encode_vbyte([shared])
         out += suffix
-        out += encode_vbyte([document_frequency])
+        out.append(0)
         previous = term
+    out += encode_vbyte([
+        document_frequency for _, document_frequency in term_metadata
+    ])
     return bytes(out)
 
 
 def decode_terms(data: bytes) -> Tuple[List[str], List[int]]:
+    if data.startswith(TERMS_MAGIC):
+        (count,), pos = decode_vbyte(data, len(TERMS_MAGIC), 1)
+        terms: List[str] = []
+        previous = ""
+        for _ in range(count):
+            (shared,), pos = decode_vbyte(data, pos, 1)
+            end = data.index(0, pos)
+            suffix = data[pos:end].decode("utf-8")
+            pos = end + 1
+            term = previous[:shared] + suffix
+            terms.append(term)
+            previous = term
+        document_frequencies, pos = decode_vbyte(data, pos, count)
+        return terms, document_frequencies
+
     terms: List[str] = []
     document_frequencies: List[int] = []
     pos = 0
@@ -315,13 +590,32 @@ def encode_docid(doc_id: str):
     return value.to_bytes(6, "little")
 
 
+def encode_docids(doc_ids: List[str]):
+    writer = _BitWriter()
+    for doc_id in doc_ids:
+        encoded = encode_docid(doc_id)
+        if encoded is None:
+            return None
+        writer.write(int.from_bytes(encoded, "little"), 42)
+    return DOCID_PACKED_MAGIC + writer.finish()
+
+
 def decode_docids(data: bytes) -> List[str]:
-    if not data.startswith(DOCID_MAGIC):
+    values = []
+    if data.startswith(DOCID_PACKED_MAGIC):
+        count = ((len(data) - len(DOCID_PACKED_MAGIC)) * 8) // 42
+        reader = _BitReader(data, len(DOCID_PACKED_MAGIC))
+        values = [reader.read(42) for _ in range(count)]
+    elif data.startswith(DOCID_MAGIC):
+        values = [
+            int.from_bytes(data[pos:pos + 6], "little")
+            for pos in range(len(DOCID_MAGIC), len(data), 6)
+        ]
+    else:
         return []
 
     doc_ids = []
-    for pos in range(len(DOCID_MAGIC), len(data), 6):
-        value = int.from_bytes(data[pos:pos + 6], "little")
+    for value in values:
         characters = ["0"] * 8
         for index in range(7, -1, -1):
             digit = value % 36

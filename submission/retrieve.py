@@ -11,6 +11,10 @@ survives between them except what is written to index_dir.
 """
 
 import json
+import os
+import shutil
+import tempfile
+import zlib
 from typing import List, Tuple
 
 from submission import custom_scorer
@@ -31,6 +35,74 @@ _BUILD_WORKERS = 4
 
 # Truecase gate threshold; must match InvertedIndex.save_v2's 0.5.
 _CASE_DF_RATIO = 0.5
+
+# These sidecars still contain enough byte-level redundancy for fast DEFLATE
+# to save useful space. postings.bin is deliberately excluded: after the
+# adaptive Rice codec it compresses only slightly, while dominating compression
+# CPU. The loader expands sidecars into a temporary directory before handing
+# them to the unchanged native/Python readers.
+_COMPRESSIBLE_SIDECARS = (
+    "terms.txt",
+    "case_terms.bin",
+    "doclen.bin",
+    "early.bin",
+    "docids.bin",
+    "docs.txt",
+    "tf1.bin",
+)
+def _compress_index_sidecars(index_dir: str) -> None:
+    """Replace compressible sidecars with level-1 zlib streams when smaller."""
+    for name in _COMPRESSIBLE_SIDECARS:
+        path = os.path.join(index_dir, name)
+        compressed_path = path + ".z"
+        if not os.path.isfile(path):
+            continue
+        with open(path, "rb") as f:
+            raw = f.read()
+        compressed = zlib.compress(raw, level=1)
+        if len(compressed) >= len(raw):
+            try:
+                os.remove(compressed_path)
+            except FileNotFoundError:
+                pass
+            continue
+
+        temporary_path = compressed_path + ".tmp"
+        with open(temporary_path, "wb") as f:
+            f.write(compressed)
+        os.replace(temporary_path, compressed_path)
+        os.remove(path)
+
+
+def _materialize_index_sidecars(index_dir: str):
+    """Return a reader-compatible directory and an optional cleanup path."""
+    compressed_names = [
+        name for name in _COMPRESSIBLE_SIDECARS
+        if os.path.isfile(os.path.join(index_dir, name + ".z"))
+    ]
+    if not compressed_names:
+        return index_dir, None
+
+    materialized = tempfile.mkdtemp(prefix="sre_index_load_")
+    compressed_set = set(compressed_names)
+    try:
+        for entry in os.listdir(index_dir):
+            source = os.path.join(index_dir, entry)
+            if not os.path.isfile(source):
+                continue
+            if entry.endswith(".z") and entry[:-2] in compressed_set:
+                target = os.path.join(materialized, entry[:-2])
+                with open(source, "rb") as f:
+                    data = zlib.decompress(f.read())
+                with open(target, "wb") as f:
+                    f.write(data)
+            elif entry not in compressed_set:
+                os.symlink(os.path.abspath(source),
+                           os.path.join(materialized, entry))
+    except Exception:
+        shutil.rmtree(materialized, ignore_errors=True)
+        raise
+    return materialized, materialized
 
 
 def _build_index_parallel(corpus_path: str, index_dir: str) -> bool:
@@ -66,6 +138,7 @@ def build_index(corpus_path: str, index_dir: str) -> None:
     # data never materialise as Python objects.
     try:
         if _build_index_parallel(corpus_path, index_dir):
+            _compress_index_sidecars(index_dir)
             return
     except ImportError:
         pass
@@ -96,27 +169,34 @@ def build_index(corpus_path: str, index_dir: str) -> None:
         index = InvertedIndex()
         index.build(corpus)
         index.save_v2(index_dir)
+    _compress_index_sidecars(index_dir)
 
 
 def load_index(index_dir: str) -> None:
     """Reconstruct query-time state, reading only from `index_dir`. Timed."""
     global _INDEX
 
-    # Prefer the native (C++) index: decodes postings and scores in C++,
-    # avoiding both the Python dict rebuild at load and the per-query Python
-    # loops. Falls back to InvertedIndex + bm25/boolean_vsm if unbuilt.
+    reader_dir, cleanup_dir = _materialize_index_sidecars(index_dir)
     try:
-        import submission._index_cpp  # noqa: F401  (presence check)
-        from submission import indexer
+        # Prefer the native (C++) index: decodes postings and scores in C++,
+        # avoiding both the Python dict rebuild at load and the per-query Python
+        # loops. Falls back to InvertedIndex + bm25/boolean_vsm if unbuilt.
+        try:
+            import submission._index_cpp  # noqa: F401  (presence check)
+            from submission import indexer
 
-        with open(f"{index_dir}/meta.json") as f:
-            meta = json.load(f)
-        indexer.set_case_terms(indexer._load_case_terms(index_dir, meta))
-        custom_scorer.build_native(index_dir)
-        _INDEX = "native"  # non-None sentinel; scoring lives in custom_scorer
-    except ImportError:
-        _INDEX = InvertedIndex.load_v2(index_dir)
-        custom_scorer.build(_INDEX)
+            with open(f"{reader_dir}/meta.json") as f:
+                meta = json.load(f)
+            indexer.set_case_terms(
+                indexer._load_case_terms(reader_dir, meta))
+            custom_scorer.build_native(reader_dir)
+            _INDEX = "native"  # non-None sentinel; scoring lives in custom_scorer
+        except ImportError:
+            _INDEX = InvertedIndex.load_v2(reader_dir)
+            custom_scorer.build(_INDEX)
+    finally:
+        if cleanup_dir is not None:
+            shutil.rmtree(cleanup_dir, ignore_errors=True)
 
 
 def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:

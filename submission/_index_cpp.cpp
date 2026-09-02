@@ -27,6 +27,9 @@
 namespace py = pybind11;
 
 struct NativeIndex {
+    using OrdHit = std::pair<int, double>;
+    using DocHit = std::pair<std::string, double>;
+
     int N = 0;
     double avg_doc_len = 0.0;
     std::vector<std::string> docid;   // ordinal -> doc_id string
@@ -84,12 +87,170 @@ struct NativeIndex {
         return l;
     }
 
+    struct PackedBitReader {
+        const unsigned char *p;
+        size_t pos;
+        uint64_t buffer = 0;
+        int bits = 0;
+
+        PackedBitReader(const unsigned char *data, size_t start)
+            : p(data), pos(start) {}
+
+        uint32_t read(int width) {
+            if (width == 0) return 0;
+            while (bits < width) {
+                buffer |= static_cast<uint64_t>(p[pos++]) << bits;
+                bits += 8;
+            }
+            uint64_t mask = width == 32
+                ? 0xFFFFFFFFULL
+                : ((1ULL << width) - 1ULL);
+            uint32_t value = static_cast<uint32_t>(buffer & mask);
+            buffer >>= width;
+            bits -= width;
+            return value;
+        }
+
+        uint32_t read_vbyte() {
+            uint32_t value = 0;
+            int shift = 0;
+            while (true) {
+                uint32_t byte = read(8);
+                value |= (byte & 0x7Fu) << shift;
+                if (byte & 0x80u) return value;
+                shift += 7;
+            }
+        }
+    };
+
+    // TF2-TF6 decoder. TF5+ keep the bitstream continuous across terms;
+    // earlier packed versions byte-pad each term.
+    static void get_postings_packed(
+        PackedBitReader &reader, long df, long N,
+        std::vector<int> &ords, std::vector<int> &tfs,
+        bool all_tf_one = false, bool gap_rice = false,
+        bool sparse_tf = false, bool adaptive_gap_rice = false) {
+        long m = df;
+        int l = ef_l(m, N);
+        ords.resize(static_cast<size_t>(m));
+        if (gap_rice) {
+            int64_t previous = -1;
+            for (long start = 0; start < m; start += 32) {
+                long count = std::min(32L, m - start);
+                int rice_k = l;
+                if (adaptive_gap_rice && reader.read(1)) {
+                    int code = static_cast<int>(reader.read(3));
+                    rice_k = code == 7
+                        ? static_cast<int>(reader.read(5))
+                        : l + code - 3;
+                }
+                for (long j = 0; j < count; j++) {
+                    uint32_t quotient = 0;
+                    while (reader.read(1) != 0) quotient++;
+                    uint32_t remainder = reader.read(rice_k);
+                    previous += static_cast<int64_t>(
+                        ((quotient << rice_k) | remainder) + 1u);
+                    ords[static_cast<size_t>(start + j)] =
+                        static_cast<int>(previous);
+                }
+            }
+        } else {
+            std::vector<uint32_t> lows(static_cast<size_t>(m), 0);
+            for (long i = 0; i < m; i++)
+                lows[static_cast<size_t>(i)] = reader.read(l);
+
+            long high = 0;
+            long ones = 0;
+            while (ones < m) {
+                if (reader.read(1)) {
+                    ords[static_cast<size_t>(ones)] = static_cast<int>(
+                        (high << l) | lows[static_cast<size_t>(ones)]);
+                    ones++;
+                } else {
+                    high++;
+                }
+            }
+        }
+
+        tfs.resize(static_cast<size_t>(m));
+        if (all_tf_one) {
+            std::fill(tfs.begin(), tfs.end(), 1);
+            return;
+        }
+
+        auto read_tf_values = [&](long count) {
+            std::vector<uint32_t> values(static_cast<size_t>(count));
+            long done = 0;
+            while (done < count) {
+                long block_size =
+                    std::min(static_cast<long>(128), count - done);
+                int header = static_cast<int>(reader.read(8));
+                if (header & 0x80) {
+                    int rice_k = header & 0x1F;
+                    for (long j = 0; j < block_size; j++) {
+                        uint32_t quotient = 0;
+                        while (reader.read(1) != 0) quotient++;
+                        uint32_t remainder = reader.read(rice_k);
+                        values[static_cast<size_t>(done + j)] =
+                            (quotient << rice_k) | remainder;
+                    }
+                } else {
+                    int width = header;
+                    for (long j = 0; j < block_size; j++)
+                        values[static_cast<size_t>(done + j)] =
+                            reader.read(width);
+                }
+                done += block_size;
+            }
+            return values;
+        };
+
+        if (sparse_tf) {
+            std::fill(tfs.begin(), tfs.end(), 1);
+            long exception_count =
+                static_cast<long>(reader.read_vbyte());
+            int position_k = ef_l(exception_count, m);
+            std::vector<int> positions(
+                static_cast<size_t>(exception_count));
+            int64_t previous = -1;
+            for (long i = 0; i < exception_count; i++) {
+                uint32_t quotient = 0;
+                while (reader.read(1) != 0) quotient++;
+                uint32_t remainder = reader.read(position_k);
+                previous += static_cast<int64_t>(
+                    ((quotient << position_k) | remainder) + 1u);
+                positions[static_cast<size_t>(i)] =
+                    static_cast<int>(previous);
+            }
+            auto excess = read_tf_values(exception_count);
+            for (long i = 0; i < exception_count; i++)
+                tfs[static_cast<size_t>(
+                    positions[static_cast<size_t>(i)])] =
+                    static_cast<int>(
+                        excess[static_cast<size_t>(i)] + 2u);
+        } else {
+            auto values = read_tf_values(m);
+            for (long i = 0; i < m; i++)
+                tfs[static_cast<size_t>(i)] =
+                    static_cast<int>(
+                        values[static_cast<size_t>(i)] + 1u);
+        }
+    }
+
+    static void get_postings_packed_term(
+        const unsigned char *p, size_t &pos, long df, long N,
+        std::vector<int> &ords, std::vector<int> &tfs,
+        bool all_tf_one = false, bool gap_rice = false,
+        bool sparse_tf = false) {
+        PackedBitReader reader(p, pos);
+        get_postings_packed(
+            reader, df, N, ords, tfs, all_tf_one, gap_rice, sparse_tf);
+        pos = reader.pos;
+    }
+
     // Inverse of _spimi_cpp.cpp's put_postings_ef / indexer._encode_postings:
-    // Elias-Fano for monotone doc ordinals, followed by (tf-1) in adaptive
-    // 128-posting blocks. Legacy header bytes below 0x80 specify a fixed bit
-    // width; headers with bit 7 set specify Rice coding with k in the low five
-    // bits. For terms marked in tf1.bin, all tfs are one and the TF section is
-    // omitted. l is recomputed from (df, N), not stored.
+    // legacy TF1 Elias-Fano streams, whose low bits, high bits, and individual
+    // TF blocks are each byte-aligned.
     static void get_postings(const unsigned char *p, size_t &pos, long df, long N,
                              std::vector<int> &ords, std::vector<int> &tfs,
                              bool all_tf_one = false) {
@@ -210,19 +371,43 @@ struct NativeIndex {
         {
             std::ifstream packed(dir + "/docids.bin", std::ios::binary);
             char magic[4] = {};
-            if (packed.read(magic, 4) &&
-                std::string(magic, 4) == std::string("D36\1", 4)) {
-                uint64_t count = 0;
+            if (packed.read(magic, 4) && std::string(magic, 3) == "D36") {
+                int version = static_cast<unsigned char>(magic[3]);
                 packed.seekg(0, std::ios::end);
                 std::streamoff total = packed.tellg();
                 packed.seekg(4, std::ios::beg);
-                count = total >= 4 ? static_cast<uint64_t>((total - 4) / 6) : 0;
+                uint64_t count = 0;
+                if (version == 1)
+                    count = total >= 4
+                        ? static_cast<uint64_t>((total - 4) / 6)
+                        : 0;
+                else if (version == 2)
+                    count = total >= 4
+                        ? static_cast<uint64_t>((total - 4) * 8 / 42)
+                        : 0;
+
                 docid.reserve(static_cast<size_t>(count));
+                uint64_t buffer = 0;
+                int bits = 0;
                 for (uint64_t i = 0; i < count; i++) {
-                    uint64_t value = 0;
-                    for (int j = 0; j < 6; j++)
-                        value |= static_cast<uint64_t>(
-                            static_cast<unsigned char>(packed.get())) << (8 * j);
+                    uint64_t value;
+                    if (version == 1) {
+                        value = 0;
+                        for (int j = 0; j < 6; j++)
+                            value |= static_cast<uint64_t>(
+                                static_cast<unsigned char>(packed.get()))
+                                << (8 * j);
+                    } else {
+                        while (bits < 42) {
+                            buffer |= static_cast<uint64_t>(
+                                static_cast<unsigned char>(packed.get()))
+                                << bits;
+                            bits += 8;
+                        }
+                        value = buffer & ((1ULL << 42) - 1ULL);
+                        buffer >>= 42;
+                        bits -= 42;
+                    }
                     std::string id(8, '0');
                     for (int j = 7; j >= 0; j--) {
                         int digit = static_cast<int>(value % 36u);
@@ -232,7 +417,9 @@ struct NativeIndex {
                     }
                     docid.push_back(std::move(id));
                 }
-            } else {
+                if (version != 1 && version != 2) docid.clear();
+            }
+            if (docid.empty()) {
                 std::ifstream f(dir + "/docs.txt");
                 std::string line;
                 while (std::getline(f, line)) docid.push_back(line);
@@ -256,9 +443,9 @@ struct NativeIndex {
         const unsigned char *p = reinterpret_cast<const unsigned char *>(blob.data());
         size_t pos = 0;
 
-        // terms.txt is front-coded (alphabetical): per term VByte(shared prefix
-        // len) VByte(suffix len) suffix VByte(df), reconstructed against the
-        // previous term. Mirrors indexer._decode_terms / _spimi put_term_frontcoded.
+        // TM2 separates NUL-terminated front-coded terms from the contiguous
+        // VByte df stream for better compression locality. The original
+        // interleaved format remains readable for existing indices.
         std::vector<std::string> terms;
         std::vector<int> dfs;
         {
@@ -266,16 +453,41 @@ struct NativeIndex {
             const unsigned char *tp = reinterpret_cast<const unsigned char *>(tb.data());
             size_t tpos = 0, tn = tb.size();
             std::string prev;
-            while (tpos < tn) {
-                long shared = vbyte(tp, tpos);
-                long suflen = vbyte(tp, tpos);
-                std::string term = prev.substr(0, static_cast<size_t>(shared));
-                term.append(reinterpret_cast<const char *>(tp + tpos), static_cast<size_t>(suflen));
-                tpos += static_cast<size_t>(suflen);
-                long df = vbyte(tp, tpos);
-                terms.push_back(term);
-                dfs.push_back(static_cast<int>(df));
-                prev = term;
+            if (tn >= 3 && tb.compare(0, 3, "TM2") == 0) {
+                tpos = 3;
+                long count = vbyte(tp, tpos);
+                terms.reserve(static_cast<size_t>(count));
+                dfs.reserve(static_cast<size_t>(count));
+                for (long i = 0; i < count; i++) {
+                    long shared = vbyte(tp, tpos);
+                    size_t end = tpos;
+                    while (end < tn && tp[end] != 0) end++;
+                    std::string term =
+                        prev.substr(0, static_cast<size_t>(shared));
+                    term.append(
+                        reinterpret_cast<const char *>(tp + tpos),
+                        end - tpos);
+                    tpos = end + 1;
+                    terms.push_back(term);
+                    prev = term;
+                }
+                for (long i = 0; i < count; i++)
+                    dfs.push_back(static_cast<int>(vbyte(tp, tpos)));
+            } else {
+                while (tpos < tn) {
+                    long shared = vbyte(tp, tpos);
+                    long suflen = vbyte(tp, tpos);
+                    std::string term =
+                        prev.substr(0, static_cast<size_t>(shared));
+                    term.append(
+                        reinterpret_cast<const char *>(tp + tpos),
+                        static_cast<size_t>(suflen));
+                    tpos += static_cast<size_t>(suflen);
+                    long df = vbyte(tp, tpos);
+                    terms.push_back(term);
+                    dfs.push_back(static_cast<int>(df));
+                    prev = term;
+                }
             }
         }
         int T = static_cast<int>(terms.size());
@@ -283,39 +495,81 @@ struct NativeIndex {
         t_tfs.resize(T);
         t_early_ords.resize(T);
         t_df.resize(T);
-        std::vector<uint8_t> tf_all_one(T, 0);
+        std::vector<uint8_t> tf_mode(T, 0);
+        bool packed_postings = false;
+        bool gap_rice_postings = false;
+        bool sparse_tf_postings = false;
+        bool continuous_postings = false;
+        bool adaptive_gap_postings = false;
         {
             std::string tfb = read_binary(dir + "/tf1.bin");
             size_t bytes = (static_cast<size_t>(T) + 7) / 8;
-            if (tfb.size() >= 3 + bytes && tfb.compare(0, 3, "TF1") == 0) {
+            adaptive_gap_postings =
+                tfb.size() >= 3 && tfb.compare(0, 3, "TF6") == 0;
+            continuous_postings =
+                adaptive_gap_postings ||
+                (tfb.size() >= 3 && tfb.compare(0, 3, "TF5") == 0);
+            sparse_tf_postings =
+                continuous_postings ||
+                (tfb.size() >= 3 && tfb.compare(0, 3, "TF4") == 0);
+            gap_rice_postings =
+                sparse_tf_postings ||
+                (tfb.size() >= 3 && tfb.compare(0, 3, "TF3") == 0);
+            packed_postings =
+                gap_rice_postings ||
+                (tfb.size() >= 3 && tfb.compare(0, 3, "TF2") == 0);
+            if (sparse_tf_postings && tfb.size() >= 3 + bytes) {
                 for (int ti = 0; ti < T; ti++)
-                    tf_all_one[ti] = static_cast<uint8_t>(
+                    tf_mode[ti] =
+                        ((static_cast<unsigned char>(tfb[3 + ti / 8])
+                          >> (ti % 8)) & 1u)
+                            ? 1u
+                            : 2u;
+            } else if (
+                tfb.size() >= 3 + bytes &&
+                (tfb.compare(0, 3, "TF1") == 0 || packed_postings)) {
+                for (int ti = 0; ti < T; ti++)
+                    tf_mode[ti] = static_cast<uint8_t>(
                         (static_cast<unsigned char>(tfb[3 + ti / 8])
                          >> (ti % 8)) & 1u);
             }
         }
+        PackedBitReader continuous_reader(p, 0);
         for (int ti = 0; ti < T; ti++) {
             int df = dfs[ti];
             t_df[ti] = df;
             term_id[terms[ti]] = ti;
             auto &ords = t_ords[ti];
             auto &tfs = t_tfs[ti];
-            get_postings(p, pos, df, N, ords, tfs,
-                         tf_all_one[ti] != 0);  // Elias-Fano codec
+            if (continuous_postings)
+                get_postings_packed(
+                    continuous_reader, df, N, ords, tfs,
+                    tf_mode[ti] == 1, true, tf_mode[ti] == 2,
+                    adaptive_gap_postings);
+            else if (packed_postings)
+                get_postings_packed_term(
+                    p, pos, df, N, ords, tfs, tf_mode[ti] == 1,
+                    gap_rice_postings, tf_mode[ti] == 2);
+            else
+                get_postings(
+                    p, pos, df, N, ords, tfs, tf_mode[ti] == 1);
         }
     }
 
     void load_early_matches(const std::string &dir) {
         int T = static_cast<int>(t_df.size());
-        // Optional prefix-presence stream. New indexes store sparse posting
-        // positions as Elias-Fano records ("SEF1"); old packed-bit indexes are
-        // still accepted. In RAM retain only the matching document ordinals,
-        // so early_match traverses the sparse signal rather than full postings.
+        // Optional prefix-presence stream. SEF2 stores Rice-coded gaps between
+        // sparse posting positions; SEF1 used Elias-Fano. Both are accepted,
+        // as is the original dense packed-bit stream.
         {
             std::string eb = read_binary(dir + "/early.bin");
             const unsigned char *ep =
                 reinterpret_cast<const unsigned char *>(eb.data());
-            if (eb.size() >= 4 && eb.compare(0, 4, "SEF1") == 0) {
+            bool sparse_rice =
+                eb.size() >= 4 && eb.compare(0, 4, "SEF2") == 0;
+            bool sparse_ef =
+                eb.size() >= 4 && eb.compare(0, 4, "SEF1") == 0;
+            if (sparse_rice || sparse_ef) {
                 size_t bitmap_pos = 4;
                 size_t bitmap_bytes = (static_cast<size_t>(T) + 7) / 8;
                 size_t epos = bitmap_pos + bitmap_bytes;
@@ -326,7 +580,25 @@ struct NativeIndex {
                             continue;
                         long m = vbyte(ep, epos);
                         std::vector<int> positions;
-                        get_monotone_ef(ep, epos, m, t_df[ti], positions);
+                        if (sparse_rice) {
+                            positions.resize(static_cast<size_t>(m));
+                            int k = ef_l(m, t_df[ti]);
+                            PackedBitReader reader(ep, epos);
+                            int64_t previous = -1;
+                            for (long i = 0; i < m; i++) {
+                                uint32_t quotient = 0;
+                                while (reader.read(1) != 0) quotient++;
+                                uint32_t remainder = reader.read(k);
+                                previous += static_cast<int64_t>(
+                                    ((quotient << k) | remainder) + 1u);
+                                positions[static_cast<size_t>(i)] =
+                                    static_cast<int>(previous);
+                            }
+                            epos = reader.pos;
+                        } else {
+                            get_monotone_ef(
+                                ep, epos, m, t_df[ti], positions);
+                        }
                         auto &docs = t_early_ords[ti];
                         docs.reserve(positions.size());
                         for (int pi : positions)
@@ -412,8 +684,8 @@ struct NativeIndex {
         build_forward_index();
     }
 
-    std::vector<std::pair<std::string, double>>
-    topk(std::vector<double> &score, std::vector<int> &touched, int k) {
+    std::vector<OrdHit>
+    topk_ord(std::vector<double> &score, std::vector<int> &touched, int k) {
         std::vector<std::pair<double, int>> items;
         items.reserve(touched.size());
         for (int d : touched) items.push_back({score[d], d});
@@ -423,15 +695,24 @@ struct NativeIndex {
             [](const std::pair<double, int> &a, const std::pair<double, int> &b) {
                 return a.first > b.first || (a.first == b.first && a.second < b.second);
             });
-        std::vector<std::pair<std::string, double>> out;
+        std::vector<OrdHit> out;
         out.reserve(kk);
         for (size_t i = 0; i < kk; i++)
-            out.push_back({docid[items[i].second], items[i].first});
+            out.push_back({items[i].second, items[i].first});
         return out;
     }
 
-    std::vector<std::pair<std::string, double>>
-    bm25(const std::vector<std::string> &tokens, double k1, double b, int k) {
+    std::vector<DocHit> materialize(const std::vector<OrdHit> &hits) const {
+        std::vector<DocHit> out;
+        out.reserve(hits.size());
+        for (const auto &hit : hits)
+            out.push_back({docid[hit.first], hit.second});
+        return out;
+    }
+
+    std::vector<OrdHit>
+    bm25_ord(
+        const std::vector<std::string> &tokens, double k1, double b, int k) {
         std::vector<double> score(N, 0.0);
         std::vector<int> touched;
         for (const auto &tok : tokens) {
@@ -449,11 +730,16 @@ struct NativeIndex {
                             (tf + k1 * (1 - b + b * doc_len[d] / avg_doc_len));
             }
         }
-        return topk(score, touched, k);
+        return topk_ord(score, touched, k);
     }
 
-    std::vector<std::pair<std::string, double>>
-    vsm(const std::vector<std::string> &tokens, int k) {
+    std::vector<DocHit>
+    bm25(const std::vector<std::string> &tokens, double k1, double b, int k) {
+        return materialize(bm25_ord(tokens, k1, b, k));
+    }
+
+    std::vector<OrdHit>
+    vsm_ord(const std::vector<std::string> &tokens, int k) {
         std::unordered_map<std::string, int> qcount;
         for (const auto &t : tokens) qcount[t]++;
 
@@ -469,7 +755,7 @@ struct NativeIndex {
             qnorm += w * w;
         }
         qnorm = std::sqrt(qnorm);
-        std::vector<std::pair<std::string, double>> empty;
+        std::vector<OrdHit> empty;
         if (qnorm == 0.0) return empty;
 
         std::vector<double> score(N, 0.0);
@@ -487,15 +773,21 @@ struct NativeIndex {
                 score[d] += st * (dw / doc_norm[d]);
             }
         }
-        return topk(score, touched, k);
+        return topk_ord(score, touched, k);
+    }
+
+    std::vector<DocHit>
+    vsm(const std::vector<std::string> &tokens, int k) {
+        return materialize(vsm_ord(tokens, k));
     }
 
     // Coordination/coverage arm: rank documents by how many distinct query
     // terms they contain. The optional idf weighting rewards coverage of rare
     // terms while keeping the signal independent of corpus-specific labels.
-    std::vector<std::pair<std::string, double>>
-    coverage(const std::vector<std::string> &tokens, int k, bool idf_weighted,
-             double idf_power = 1.0) {
+    std::vector<OrdHit>
+    coverage_ord(
+        const std::vector<std::string> &tokens, int k, bool idf_weighted,
+        double idf_power = 1.0) {
         std::unordered_set<int> seen;
         std::vector<int> qterms;
         for (const auto &tok : tokens) {
@@ -503,7 +795,7 @@ struct NativeIndex {
             if (it == term_id.end()) continue;
             if (seen.insert(it->second).second) qterms.push_back(it->second);
         }
-        std::vector<std::pair<std::string, double>> empty;
+        std::vector<OrdHit> empty;
         if (qterms.empty()) return empty;
 
         std::vector<double> score(N, 0.0);
@@ -517,15 +809,22 @@ struct NativeIndex {
                 score[d] += w;
             }
         }
-        return topk(score, touched, k);
+        return topk_ord(score, touched, k);
+    }
+
+    std::vector<DocHit>
+    coverage(const std::vector<std::string> &tokens, int k, bool idf_weighted,
+             double idf_power = 1.0) {
+        return materialize(
+            coverage_ord(tokens, k, idf_weighted, idf_power));
     }
 
     // Rank documents by the number of distinct query terms present in the
     // first 12 raw words. early.bin stores a sparse posting list for each
     // term, containing only the documents where that term occurs in the
     // prefix.
-    std::vector<std::pair<std::string, double>>
-    early_match(const std::vector<std::string> &tokens, int k) {
+    std::vector<OrdHit>
+    early_match_ord(const std::vector<std::string> &tokens, int k) {
         std::unordered_set<int> seen;
         std::vector<int> qterms;
         for (const auto &tok : tokens) {
@@ -541,7 +840,12 @@ struct NativeIndex {
                 score[d] += 1.0;
             }
         }
-        return topk(score, touched, k);
+        return topk_ord(score, touched, k);
+    }
+
+    std::vector<DocHit>
+    early_match(const std::vector<std::string> &tokens, int k) {
+        return materialize(early_match_ord(tokens, k));
     }
 
     // BM25 scoring of a *weighted* bag of query terms into `score`/`touched`.
@@ -572,12 +876,12 @@ struct NativeIndex {
     // with the original query model: P(w|q') = lambda*P(w|q0) + (1-lambda)*P(w|R).
     // Round 2: weighted BM25 with that expanded query. Returns top-`cand`
     // (doc_id, score) for fusion, exactly like bm25().
-    std::vector<std::pair<std::string, double>>
-    rm3(const std::vector<std::string> &tokens, int R, int M, double lambda_,
-        double k1, double b, int cand,
-        double fb_temp, bool novel_only,
+    std::vector<OrdHit>
+    rm3_ord(
+        const std::vector<std::string> &tokens, int R, int M, double lambda_,
+        double k1, double b, int cand, double fb_temp, bool novel_only,
         double k1_round2 = -1.0, double b_round2 = -1.0) {
-        std::vector<std::pair<std::string, double>> empty;
+        std::vector<OrdHit> empty;
         if (!has_forward) return empty;
 
         // Round 1 BM25.
@@ -672,7 +976,17 @@ struct NativeIndex {
         double rk1 = k1_round2 > 0.0 ? k1_round2 : k1;
         double rb = b_round2 >= 0.0 ? b_round2 : b;
         bm25_weighted(qexp, rk1, rb, score, touched);
-        return topk(score, touched, cand);
+        return topk_ord(score, touched, cand);
+    }
+
+    std::vector<DocHit>
+    rm3(const std::vector<std::string> &tokens, int R, int M, double lambda_,
+        double k1, double b, int cand,
+        double fb_temp, bool novel_only,
+        double k1_round2 = -1.0, double b_round2 = -1.0) {
+        return materialize(
+            rm3_ord(tokens, R, M, lambda_, k1, b, cand, fb_temp,
+                    novel_only, k1_round2, b_round2));
     }
 
     // Run the two fusion arms (RM3-or-BM25 and VSM) concurrently. Both arms
@@ -683,27 +997,39 @@ struct NativeIndex {
     // pybind def), so the two C++ threads run truly in parallel. Returns
     // {bm_hits, vs_hits}; retrieve() consumes these internally, while the
     // binding remains exposed for tuning scripts.
-    std::pair<std::vector<std::pair<std::string, double>>,
-              std::vector<std::pair<std::string, double>>>
+    std::pair<std::vector<OrdHit>, std::vector<OrdHit>>
+    arms_ord(
+        const std::vector<std::string> &tokens, bool use_rm3,
+        int R, int M, double lambda_, double k1, double b, int cand,
+        double fb_temp, bool novel_only,
+        double k1_round2 = -1.0, double b_round2 = -1.0) {
+        std::vector<OrdHit> vs_hits;
+        std::thread vt([&] { vs_hits = vsm_ord(tokens, cand); });
+        std::vector<OrdHit> bm_hits =
+            (use_rm3 && has_forward)
+                ? rm3_ord(
+                    tokens, R, M, lambda_, k1, b, cand, fb_temp,
+                    novel_only, k1_round2, b_round2)
+                : bm25_ord(tokens, k1, b, cand);
+        vt.join();
+        return {bm_hits, vs_hits};
+    }
+
+    std::pair<std::vector<DocHit>, std::vector<DocHit>>
     arms(const std::vector<std::string> &tokens, bool use_rm3,
          int R, int M, double lambda_, double k1, double b, int cand,
          double fb_temp, bool novel_only,
          double k1_round2 = -1.0, double b_round2 = -1.0) {
-        std::vector<std::pair<std::string, double>> vs_hits;
-        std::thread vt([&] { vs_hits = vsm(tokens, cand); });
-        std::vector<std::pair<std::string, double>> bm_hits =
-            (use_rm3 && has_forward)
-                ? rm3(tokens, R, M, lambda_, k1, b, cand, fb_temp, novel_only,
-                     k1_round2, b_round2)
-                : bm25(tokens, k1, b, cand);
-        vt.join();
-        return {bm_hits, vs_hits};
+        auto hits = arms_ord(
+            tokens, use_rm3, R, M, lambda_, k1, b, cand, fb_temp,
+            novel_only, k1_round2, b_round2);
+        return {materialize(hits.first), materialize(hits.second)};
     }
 
     // Complete query pipeline behind one pybind boundary. The raw query enters
     // once and only the final top-k leaves: tokenisation, both retrieval arms,
     // coverage/early signals, RRF fusion, and reranking all stay in C++.
-    std::vector<std::pair<std::string, double>>
+    std::vector<DocHit>
     retrieve(const std::string &query, int k, bool use_rm3,
              int R, int M, double lambda_, double k1, double b, int cand,
              double fb_temp, bool novel_only,
@@ -730,31 +1056,48 @@ struct NativeIndex {
                 tokens.push_back(tok);
         }
 
-        auto arm_hits = arms(
+        // arms() already overlaps RM3/BM25 and VSM. Coverage plus early are
+        // substantially cheaper than either main arm, so one feature worker
+        // can finish both while the main arms run, avoiding another thread's
+        // startup/contention cost. Every task only reads immutable index arrays
+        // and owns its score/touched buffers, so no locking is needed and the
+        // exact top-500 feature semantics are preserved.
+        std::vector<OrdHit> coverage_hits;
+        std::vector<OrdHit> early_hits;
+        std::thread feature_thread([&] {
+            coverage_hits = coverage_ord(tokens, cand, true);
+            early_hits = early_match_ord(tokens, cand);
+        });
+        auto arm_hits = arms_ord(
             tokens, use_rm3, R, M, lambda_, k1, b, cand, fb_temp,
             novel_only, k1_round2, b_round2);
-        auto coverage_hits = coverage(tokens, cand, true);
-        auto early_hits = early_match(tokens, cand);
+        feature_thread.join();
 
-        std::unordered_map<std::string, double> fused;
-        for (size_t i = 0; i < arm_hits.first.size(); i++)
-            fused[arm_hits.first[i].first] +=
-                w_bm / static_cast<double>(rrf_k + i + 1);
-        for (size_t i = 0; i < arm_hits.second.size(); i++)
-            fused[arm_hits.second[i].first] +=
-                (1.0 - w_bm) / static_cast<double>(rrf_k + i + 1);
+        std::unordered_map<int, double> fused_score;
+        fused_score.reserve(
+            arm_hits.first.size() + arm_hits.second.size());
+        auto add_hits = [&](const std::vector<OrdHit> &hits, double weight) {
+            for (size_t i = 0; i < hits.size(); i++)
+                fused_score[hits[i].first] +=
+                    weight / static_cast<double>(rrf_k + i + 1);
+        };
+        add_hits(arm_hits.first, w_bm);
+        add_hits(arm_hits.second, 1.0 - w_bm);
 
-        std::vector<std::pair<std::string, double>> ranked(
-            fused.begin(), fused.end());
-        auto rank_order = [](const auto &a, const auto &b) {
+        std::vector<OrdHit> ranked;
+        ranked.reserve(fused_score.size());
+        for (const auto &hit : fused_score)
+            ranked.push_back(hit);
+        auto rank_order = [&](const OrdHit &a, const OrdHit &b) {
             return a.second > b.second ||
-                   (a.second == b.second && a.first < b.first);
+                   (a.second == b.second &&
+                    docid[a.first] < docid[b.first]);
         };
         std::sort(ranked.begin(), ranked.end(), rank_order);
 
         if (coverage_alpha > 0.0) {
-            std::unordered_map<std::string, double> coverage_score;
-            std::unordered_map<std::string, double> early_score;
+            std::unordered_map<int, double> coverage_score;
+            std::unordered_map<int, double> early_score;
             for (const auto &hit : coverage_hits)
                 coverage_score[hit.first] = hit.second;
             for (const auto &hit : early_hits)
@@ -802,7 +1145,7 @@ struct NativeIndex {
         if (k < 0) k = 0;
         if (ranked.size() > static_cast<size_t>(k))
             ranked.resize(static_cast<size_t>(k));
-        return ranked;
+        return materialize(ranked);
     }
 };
 

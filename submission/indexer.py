@@ -21,15 +21,17 @@ from typing import Dict, List, Tuple
 from nltk.stem.snowball import SnowballStemmer
 
 from submission._index_codec import (
-    DOCID_MAGIC,
+    _BitReader,
+    _BitWriter,
+    _decode_packed_postings,
+    _write_packed_postings,
     decode_case_terms as _decode_case_terms,
     decode_docids as _decode_docids,
     decode_postings as _decode_postings,
     decode_terms as _decode_terms,
     decode_vbyte as _vbyte_decode_n,
     encode_case_terms as _encode_case_terms,
-    encode_docid as _pack_docid,
-    encode_postings as _encode_postings,
+    encode_docids as _encode_docids,
     encode_terms as _encode_terms,
     encode_vbyte as _vbyte_encode,
 )
@@ -276,12 +278,10 @@ class InvertedIndex:
         # when every ID is an 8-character lowercase base-36 string; otherwise
         # retain the verbatim IDs in docs.txt.
         docid_to_ord = {doc_id: i for i, doc_id in enumerate(self.doc_len)}
-        packed_ids = [_pack_docid(doc_id) for doc_id in self.doc_len]
-        if all(value is not None for value in packed_ids):
+        packed_ids = _encode_docids(list(self.doc_len))
+        if packed_ids is not None:
             with open(f"{index_dir}/docids.bin", "wb") as f:
-                f.write(DOCID_MAGIC)
-                for value in packed_ids:
-                    f.write(value)
+                f.write(packed_ids)
             if os.path.exists(f"{index_dir}/docs.txt"):
                 os.remove(f"{index_dir}/docs.txt")
         else:
@@ -298,26 +298,32 @@ class InvertedIndex:
         terms_sorted = sorted(self.postings.keys())
 
         term_meta = []  # (term, df)
-        blob = bytearray()
-        tf_one = bytearray(b"TF1" + b"\0" * ((len(terms_sorted) + 7) // 8))
+        postings_writer = _BitWriter()
+        tf_modes = bytearray(b"TF6" + b"\0" * ((len(terms_sorted) + 7) // 8))
         for term in terms_sorted:
             plist = self.postings[term]
             items = sorted((docid_to_ord[d], tf) for d, tf in plist.items())
             ords = [o for o, _ in items]
             tfs = [tf for _, tf in items]
             all_one = all(tf == 1 for tf in tfs)
+            sparse_tf = not all_one
+            i = len(term_meta)
             if all_one:
-                i = len(term_meta)
-                tf_one[3 + i // 8] |= 1 << (i % 8)
-            blob += _encode_postings(ords, tfs, self.N, all_one)  # Elias-Fano codec
+                tf_modes[3 + i // 8] |= 1 << (i % 8)
+            _write_packed_postings(
+                postings_writer, ords, tfs, self.N, all_one, gap_rice=True,
+                sparse_tf=sparse_tf,
+                adaptive_gap_rice=True,
+            )
             term_meta.append((term, len(ords)))
+        blob = postings_writer.finish()
 
         with open(f"{index_dir}/terms.txt", "wb") as f:
             f.write(_encode_terms(term_meta))
         with open(f"{index_dir}/postings.bin", "wb") as f:
             f.write(bytes(blob))
         with open(f"{index_dir}/tf1.bin", "wb") as f:
-            f.write(tf_one)
+            f.write(tf_modes)
 
         # No forward.bin is persisted: the forward index (doc -> [(term_ord,
         # tf)]) that RM3 needs is a byte-for-byte redundant transpose of the
@@ -364,19 +370,51 @@ class InvertedIndex:
         with open(f"{index_dir}/terms.txt", "rb") as f:
             terms, dfs = _decode_terms(f.read())
 
-        tf_flags = [
-            bool(
-                tf_one.startswith(b"TF1")
-                and len(tf_one) >= 3 + (len(terms) + 7) // 8
-                and ((tf_one[3 + i // 8] >> (i % 8)) & 1)
-            )
-            for i in range(len(terms))
-        ]
+        adaptive_gap_postings = tf_one.startswith(b"TF6")
+        continuous_postings = (
+            tf_one.startswith(b"TF5") or adaptive_gap_postings
+        )
+        sparse_tf_postings = (
+            tf_one.startswith(b"TF4") or continuous_postings
+        )
+        gap_rice_postings = (
+            tf_one.startswith(b"TF3") or sparse_tf_postings
+        )
+        packed_postings = tf_one.startswith(b"TF2") or gap_rice_postings
+        if sparse_tf_postings:
+            tf_modes = [
+                1 if ((tf_one[3 + i // 8] >> (i % 8)) & 1) else 2
+                for i in range(len(terms))
+            ]
+        else:
+            tf_modes = [
+                1 if (
+                    (tf_one.startswith(b"TF1") or packed_postings)
+                    and len(tf_one) >= 3 + (len(terms) + 7) // 8
+                    and ((tf_one[3 + i // 8] >> (i % 8)) & 1)
+                ) else 0
+                for i in range(len(terms))
+            ]
         pos = 0
+        postings_reader = (
+            _BitReader(blob, 0) if continuous_postings else None
+        )
         for i, (term, df) in enumerate(zip(terms, dfs)):
-            ords, tfs, pos = _decode_postings(
-                blob, pos, df, index.N, tf_flags[i]
-            )
+            if continuous_postings:
+                ords, tfs = _decode_packed_postings(
+                    postings_reader, df, index.N,
+                    all_tf_one=tf_modes[i] == 1,
+                    gap_rice=True,
+                    sparse_tf=tf_modes[i] == 2,
+                    adaptive_gap_rice=adaptive_gap_postings,
+                )
+            else:
+                ords, tfs, pos = _decode_postings(
+                    blob, pos, df, index.N, tf_modes[i] == 1,
+                    packed=packed_postings,
+                    gap_rice=gap_rice_postings,
+                    sparse_tf=tf_modes[i] == 2,
+                )
             index.postings[term] = {
                 ord_to_docid[o]: tf for o, tf in zip(ords, tfs)
             }
